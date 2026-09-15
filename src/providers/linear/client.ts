@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { JsonValue } from "../../config/schema.js";
 import type { Database, LinearConnectionRecord } from "../../db/types.js";
 
 /**
@@ -128,33 +129,7 @@ const AgentSessionUpdateResponseSchema = z.object({
   data: z.object({ agentSessionUpdate: z.object({ success: z.boolean() }) }),
 });
 
-const LINEAR_AGENT_SESSION_STATUSES = [
-  "pending",
-  "active",
-  "awaitingInput",
-  "complete",
-  "error",
-  "stale",
-] as const;
-
-const AgentSessionResponseSchema = z.object({
-  data: z.object({
-    agentSession: z
-      .object({
-        id: z.string().min(1),
-        status: z.enum(LINEAR_AGENT_SESSION_STATUSES),
-        summary: z.string().nullable().optional(),
-        url: z.string().nullable().optional(),
-        issue: z
-          .object({ id: z.string().min(1), identifier: z.string().min(1) })
-          .nullable()
-          .optional(),
-      })
-      .nullable(),
-  }),
-});
-
-export type LinearAgentSessionActivityKind =
+export type LinearAgentSessionActivityType =
   | "prompt"
   | "response"
   | "error"
@@ -162,8 +137,8 @@ export type LinearAgentSessionActivityKind =
   | "thought"
   | "action";
 
-/** GraphQL `__typename` of each `AgentActivityContent` member, by the kind Hub names it. */
-const ACTIVITY_CONTENT_TYPENAMES: ReadonlyMap<string, LinearAgentSessionActivityKind> = new Map([
+/** GraphQL `__typename` of each `AgentActivityContent` member, by its `AgentActivityType` value. */
+const ACTIVITY_CONTENT_TYPENAMES: ReadonlyMap<string, LinearAgentSessionActivityType> = new Map([
   ["AgentActivityPromptContent", "prompt"],
   ["AgentActivityResponseContent", "response"],
   ["AgentActivityErrorContent", "error"],
@@ -185,14 +160,12 @@ const AgentSessionActivityNodeSchema = z.object({
 
 const AgentSessionActivitiesResponseSchema = z.object({
   data: z.object({
-    agentSession: z
-      .object({
-        activities: z.object({
-          nodes: z.array(AgentSessionActivityNodeSchema),
-          pageInfo: z.object({ hasPreviousPage: z.boolean() }),
-        }),
-      })
-      .nullable(),
+    agentSession: z.object({
+      activities: z.object({
+        nodes: z.array(AgentSessionActivityNodeSchema),
+        pageInfo: z.object({ hasPreviousPage: z.boolean() }),
+      }),
+    }),
   }),
 });
 
@@ -299,19 +272,10 @@ export interface LinearPlanStep {
   status: "pending" | "inProgress" | "completed" | "canceled";
 }
 
-export type LinearAgentSessionStatus = (typeof LINEAR_AGENT_SESSION_STATUSES)[number];
-
-export interface LinearAgentSession {
-  id: string;
-  status: LinearAgentSessionStatus;
-  summary: string | null;
-  url: string | null;
-  issue: { id: string; identifier: string } | null;
-}
-
 /**
- * One activity read back from a session. Only the conversational kinds carry a body; thoughts and
- * actions are reported by kind so a reader can see they happened without replaying them.
+ * One activity read back from a session, discriminated by Linear's `AgentActivityType`. Only the
+ * conversational types carry a body; thoughts and actions are reported by type so a reader can see
+ * they happened without replaying them.
  */
 export interface LinearAgentSessionActivity {
   id: string;
@@ -319,8 +283,8 @@ export interface LinearAgentSessionActivity {
   signal: string | null;
   user: { id: string; name?: string } | null;
   content:
-    | { kind: "prompt" | "response" | "error" | "elicitation"; body: string }
-    | { kind: "thought" | "action" };
+    | { type: "prompt" | "response" | "error" | "elicitation"; body: string }
+    | { type: "thought" | "action" };
 }
 
 export interface LinearAgentSessionActivityHistory {
@@ -334,14 +298,6 @@ export interface LinearTeamState {
   type: string;
   position: number;
 }
-
-export type LinearJsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | LinearJsonValue[]
-  | { [key: string]: LinearJsonValue };
 
 export interface LinearIssueComment {
   id: string;
@@ -381,7 +337,7 @@ export interface LinearApiClient {
     content: LinearActivityContent;
     ephemeral?: boolean;
     signal?: LinearActivitySignal;
-    signalMetadata?: LinearJsonValue;
+    signalMetadata?: JsonValue;
   }): Promise<{ id: string }>;
   /**
    * Updates the session's plan, external links, or title. External links are only ever added or
@@ -395,10 +351,6 @@ export interface LinearApiClient {
     removedExternalUrls?: readonly string[];
     summary?: string;
   }): Promise<void>;
-  readAgentSession(input: {
-    linearOrganizationId: string;
-    agentSessionId: string;
-  }): Promise<LinearAgentSession | undefined>;
   /** The bounded, chronological activities strictly before `beforeCreatedAt`. */
   readAgentSessionActivities(input: {
     linearOrganizationId: string;
@@ -643,7 +595,7 @@ export function createLinearApiClient(options: {
     async readIssueComments(input) {
       const result = IssueCommentHistoryResponseSchema.parse(
         await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssueCommentHistory($issueId: String!, $before: DateTime!) {
+          query: `query PaseoIssueCommentHistory($issueId: String!, $before: DateTimeOrDuration!) {
             comments(
               last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
               orderBy: createdAt
@@ -742,30 +694,10 @@ export function createLinearApiClient(options: {
         throw new Error("Linear agent session update was not accepted");
       }
     },
-    async readAgentSession(input) {
-      const result = AgentSessionResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoAgentSession($id: String!) {
-            agentSession(id: $id) { id status summary url issue { id identifier } }
-          }`,
-          variables: { id: input.agentSessionId },
-        }),
-      );
-      const session = result.data.agentSession;
-      return session === null
-        ? undefined
-        : {
-            id: session.id,
-            status: session.status,
-            summary: session.summary ?? null,
-            url: session.url ?? null,
-            issue: session.issue ?? null,
-          };
-    },
     async readAgentSessionActivities(input) {
       const result = AgentSessionActivitiesResponseSchema.parse(
         await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoAgentSessionActivities($id: String!, $before: DateTime!) {
+          query: `query PaseoAgentSessionActivities($id: String!, $before: DateTimeOrDuration!) {
             agentSession(id: $id) {
               activities(
                 last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
@@ -790,7 +722,6 @@ export function createLinearApiClient(options: {
         }),
       );
       const session = result.data.agentSession;
-      if (session === null) throw new Error("Linear agent session unavailable");
       const activities = session.activities.nodes
         .map(normalizeAgentSessionActivity)
         .filter((activity) => activity !== undefined)
@@ -850,10 +781,10 @@ export function createLinearApiClient(options: {
 function normalizeAgentSessionActivity(
   node: z.infer<typeof AgentSessionActivityNodeSchema>,
 ): LinearAgentSessionActivity | undefined {
-  const kind = ACTIVITY_CONTENT_TYPENAMES.get(node.content.__typename);
-  if (kind === undefined) return undefined;
+  const type = ACTIVITY_CONTENT_TYPENAMES.get(node.content.__typename);
+  if (type === undefined) return undefined;
   const content: LinearAgentSessionActivity["content"] =
-    kind === "thought" || kind === "action" ? { kind } : { kind, body: node.content.body ?? "" };
+    type === "thought" || type === "action" ? { type } : { type, body: node.content.body ?? "" };
   return {
     id: node.id,
     createdAt: node.createdAt,

@@ -205,6 +205,11 @@ describe("Linear connection client", () => {
     });
     assert.equal(requests[0]?.authorization, "Bearer access-token");
     const request = graphqlRequest(requests[0]?.body ?? "{}");
+    // `createdAt.lt` is a DateTimeOrDuration slot: Linear rejects a DateTime! variable there.
+    assert.match(
+      request.query,
+      /query PaseoIssueCommentHistory\(\$issueId: String!, \$before: DateTimeOrDuration!\)/u,
+    );
     assert.match(request.query, /last: 49/u);
     assert.match(request.query, /orderBy: createdAt/u);
     assert.match(request.query, /createdAt: \{ lt: \$before \}/u);
@@ -739,50 +744,6 @@ describe("Linear API client contracts", () => {
     });
   });
 
-  it("reads a session's status and issue", async () => {
-    const { api, requests } = apiClient(() =>
-      json({
-        data: {
-          agentSession: {
-            id: "session-1",
-            status: "awaitingInput",
-            summary: null,
-            url: "https://linear.app/acme/issue/ENG-42#session-1",
-            issue: { id: "issue-1", identifier: "ENG-42" },
-          },
-        },
-      }),
-    );
-
-    const session = await api.readAgentSession({
-      linearOrganizationId: "linear-org",
-      agentSessionId: "session-1",
-    });
-
-    assert.deepEqual(session, {
-      id: "session-1",
-      status: "awaitingInput",
-      summary: null,
-      url: "https://linear.app/acme/issue/ENG-42#session-1",
-      issue: { id: "issue-1", identifier: "ENG-42" },
-    });
-    const request = graphqlRequest(requests[0]!.body);
-    assert.match(
-      request.query,
-      /agentSession\(id: \$id\) \{ id status summary url issue \{ id identifier \} \}/u,
-    );
-    assert.deepEqual(request.variables, { id: "session-1" });
-  });
-
-  it("returns undefined for a session Linear no longer has", async () => {
-    const { api } = apiClient(() => json({ data: { agentSession: null } }));
-
-    assert.equal(
-      await api.readAgentSession({ linearOrganizationId: "linear-org", agentSessionId: "gone" }),
-      undefined,
-    );
-  });
-
   it("reads a bounded, chronological activity history before a point in time", async () => {
     const { api, requests } = apiClient(() =>
       json({
@@ -840,28 +801,28 @@ describe("Linear API client contracts", () => {
           createdAt: "2023-11-14T22:13:19.001Z",
           signal: "stop",
           user: { id: "user-1", name: "Ada" },
-          content: { kind: "prompt", body: "Please fix" },
+          content: { type: "prompt", body: "Please fix" },
         },
         {
           id: "activity-2",
           createdAt: "2023-11-14T22:13:19.002Z",
           signal: null,
           user: { id: "app-user" },
-          content: { kind: "action" },
+          content: { type: "action" },
         },
         {
           id: "activity-3",
           createdAt: "2023-11-14T22:13:19.003Z",
           signal: null,
           user: { id: "app-user", name: "Paseo" },
-          content: { kind: "response", body: "Done" },
+          content: { type: "response", body: "Done" },
         },
       ],
     });
     const request = graphqlRequest(requests[0]!.body);
     assert.match(
       request.query,
-      /query PaseoAgentSessionActivities\(\$id: String!, \$before: DateTime!\)/u,
+      /query PaseoAgentSessionActivities\(\$id: String!, \$before: DateTimeOrDuration!\)/u,
     );
     assert.match(request.query, /last: 49/u);
     assert.match(request.query, /orderBy: createdAt/u);

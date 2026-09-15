@@ -256,7 +256,6 @@ function unusedLinearApiClient(overrides: Partial<LinearApiClient>): LinearApiCl
     createComment: unused("createComment"),
     createAgentActivity: unused("createAgentActivity"),
     updateAgentSession: unused("updateAgentSession"),
-    readAgentSession: unused("readAgentSession"),
     readAgentSessionActivities: unused("readAgentSessionActivities"),
     readTeamStates: unused("readTeamStates"),
     updateIssue: unused("updateIssue"),
