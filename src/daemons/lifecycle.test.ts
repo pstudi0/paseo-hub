@@ -1,6 +1,6 @@
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { DaemonResponseLostError } from "./protocol.js";
-import type { AgentConnection } from "./agents/index.js";
+import { DaemonAgentError, type AgentConnection, type AgentEvent } from "./agents/index.js";
 import assert from "node:assert/strict";
 import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
@@ -11,7 +11,11 @@ import {
   type DaemonDispatchLifecycle,
 } from "./lifecycle.js";
 import { createDurableWorkflowHandler } from "../workflows/engine.js";
-import type { TriggerProvider } from "../triggers/index.js";
+import type {
+  AgentDispatchNotification,
+  AgentStreamNotification,
+  TriggerProvider,
+} from "../triggers/index.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
 import type { DaemonRecord } from "../db/types.js";
 import { createLogger, serializeError } from "../logger.js";
@@ -90,7 +94,12 @@ describe("durable Hub action acknowledgement state", () => {
       let creates = 0;
       let currentSends = 0;
       let subscriptions = 0;
-      const agent = { id: AGENT_ID, workspaceId: "workspace-reconnect", status: "idle" as const };
+      const agent = {
+        id: AGENT_ID,
+        workspaceId: "workspace-reconnect",
+        status: "idle" as const,
+        pendingPermissions: [],
+      };
       const agents: AgentConnection = {
         create: async () => {
           creates++;
@@ -99,6 +108,9 @@ describe("durable Hub action acknowledgement state", () => {
         get: async () => agent,
         restore: async () => true,
         control: async () => {},
+        inspectWorkspace: async () => ({ kind: "active" }),
+        readWorkspace: async () => undefined,
+        respondToPermission: async () => "resolved",
         watch: async () => {
           subscriptions++;
           return () => {
@@ -376,6 +388,7 @@ async function acknowledgementFixture() {
     projectId: "project-ack-test",
     continuationKey: null,
     workspaceKey: null,
+    workspaceResolution: null,
     daemonId: DAEMON_ID,
     agentId: AGENT_ID,
     workspaceId: "workspace",
@@ -432,18 +445,32 @@ class AcknowledgementConnection implements DaemonConnection {
     control: async (_agentId, _workspaceId, action) => {
       this.actions.push(action);
     },
+    inspectWorkspace: async () => {
+      throw new Error("not used");
+    },
+    readWorkspace: async () => {
+      throw new Error("not used");
+    },
+    respondToPermission: async () => {
+      throw new Error("not used");
+    },
     watch: async (_agentId, listener) =>
       this.on((event) => {
         if (event.type === "agent_stream") listener(event);
         else
           listener({
             type: "agent_update",
-            agent: { id: event.agentId, workspaceId: "workspace", status: event.agent.status },
+            agent: {
+              id: event.agentId,
+              workspaceId: "workspace",
+              status: event.agent.status,
+              pendingPermissions: [],
+            },
             timestamp: event.timestamp,
           });
       }),
   };
-  readonly actions: Array<"interrupt" | "archive"> = [];
+  readonly actions: Array<"interrupt" | "archive" | "archive_agent"> = [];
   private readonly handlers = new Set<(event: DaemonEvent) => void | Promise<void>>();
 
   on(handler: (event: DaemonEvent) => void | Promise<void>): () => void {
@@ -532,4 +559,481 @@ function agentIdle(): DaemonEvent {
     timestamp: ACKNOWLEDGED_AT.toISOString(),
     agent: { id: AGENT_ID, status: "idle" },
   };
+}
+
+describe("execution control and provider stream observation", () => {
+  it("tells the provider where the agent landed and forwards only that agent's stream without blocking", async () => {
+    const fixture = await dispatchedFixture();
+    try {
+      const dispatched = fixture.dispatched[0];
+      assert.ok(dispatched);
+      assert.deepEqual(
+        {
+          executionId: dispatched.executionId,
+          daemonId: dispatched.daemonId,
+          agentId: dispatched.agentId,
+          workspaceId: dispatched.workspaceId,
+          action: dispatched.action,
+          workspace: dispatched.workspace,
+          triggerContext: dispatched.triggerContext,
+          outputContext: dispatched.outputContext,
+        },
+        {
+          executionId: EXECUTION_ID,
+          daemonId: DAEMON_ID,
+          agentId: AGENT_ID,
+          workspaceId: "workspace-control",
+          action: "created",
+          workspace: { action: "created" },
+          triggerContext: { provider: "test" },
+          outputContext: { provider: "test", arrival: 1 },
+        },
+      );
+      await dispatched.send("activity-1", "keep going");
+      await dispatched.cancel();
+      assert.deepEqual(fixture.connection.sends, [
+        { agentId: AGENT_ID, messageId: EXECUTION_ID, text: "Work on the issue" },
+        { agentId: AGENT_ID, messageId: "activity-1", text: "keep going" },
+      ]);
+      assert.deepEqual(fixture.connection.actions, ["interrupt"]);
+
+      fixture.connection.emit({
+        type: "agent_stream",
+        agentId: "agent-of-another-execution",
+        event: { type: "turn_started", provider: "codex" },
+        timestamp: ACKNOWLEDGED_AT.toISOString(),
+      });
+      fixture.connection.emit({
+        type: "agent_stream",
+        agentId: AGENT_ID,
+        event: { type: "turn_started", provider: "codex" },
+        timestamp: ACKNOWLEDGED_AT.toISOString(),
+      });
+      await settle();
+      assert.deepEqual(
+        fixture.streamed.map((item) => [item.executionId, item.agentId, item.event.type]),
+        [[EXECUTION_ID, AGENT_ID, "turn_started"]],
+      );
+      assert.equal(fixture.streamed[0]?.daemonId, DAEMON_ID);
+      assert.deepEqual(fixture.streamed[0]?.observedAt, ACKNOWLEDGED_AT);
+
+      // A slow provider must not delay the daemon event chain behind it.
+      let releaseHook!: () => void;
+      fixture.gate.hook = new Promise<void>((resolve) => {
+        releaseHook = resolve;
+      });
+      fixture.connection.emit({
+        type: "agent_stream",
+        agentId: AGENT_ID,
+        event: { type: "turn_completed", provider: "codex" },
+        timestamp: ACKNOWLEDGED_AT.toISOString(),
+      });
+      fixture.connection.emit({
+        type: "agent_update",
+        agent: {
+          id: AGENT_ID,
+          workspaceId: "workspace-control",
+          status: "closed",
+          pendingPermissions: [],
+        },
+        timestamp: ACKNOWLEDGED_AT.toISOString(),
+      });
+      await settle();
+      assert.equal((await fixture.database.findAgentExecutionById(EXECUTION_ID))?.status, "failed");
+      assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 0);
+      releaseHook();
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+
+  it("provider stream hook failure is reported, not fatal", async () => {
+    const canary = "linear-mirror-secret-7d21";
+    const fixture = await dispatchedFixture({ streamFailure: canary });
+    try {
+      fixture.connection.emit({
+        type: "agent_stream",
+        agentId: AGENT_ID,
+        event: { type: "turn_started", provider: "codex" },
+        timestamp: ACKNOWLEDGED_AT.toISOString(),
+      });
+      await settle();
+      assertOneFailure(fixture.stream, {
+        operation: "daemon.provider.stream",
+        component: "daemons",
+        canary,
+      });
+      assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 1);
+
+      fixture.connection.emit({
+        type: "agent_update",
+        agent: {
+          id: AGENT_ID,
+          workspaceId: "workspace-control",
+          status: "closed",
+          pendingPermissions: [],
+        },
+        timestamp: ACKNOWLEDGED_AT.toISOString(),
+      });
+      await settle();
+      assert.equal((await fixture.database.findAgentExecutionById(EXECUTION_ID))?.status, "failed");
+      assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 0);
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+    assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 0);
+  });
+
+  it("reports a failing dispatch hook once and keeps the execution running", async () => {
+    const canary = "linear-dispatch-secret-1b0e";
+    const fixture = await dispatchedFixture({ dispatchFailure: canary });
+    try {
+      assertOneFailure(fixture.stream, {
+        operation: "daemon.provider.dispatched",
+        component: "daemons",
+        canary,
+      });
+      assert.equal(
+        (await fixture.database.findAgentExecutionById(EXECUTION_ID))?.status,
+        "running",
+      );
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+
+  it("steers a live agent verbatim unless a permission is pending", async () => {
+    const fixture = await controlFixture();
+    try {
+      assert.equal(await fixture.lifecycle.steer(EXECUTION_ID, "activity-1", "more"), "sent");
+      assert.deepEqual(fixture.connection.sends, [
+        { agentId: AGENT_ID, messageId: "activity-1", text: "more" },
+      ]);
+
+      fixture.connection.pendingPermissions = [{ id: "perm-1" }, { id: "perm-2" }];
+      assert.deepEqual(await fixture.lifecycle.steer(EXECUTION_ID, "activity-2", "answer"), {
+        status: "permission_pending",
+        requestId: "perm-1",
+      });
+      assert.equal(fixture.connection.sends.length, 1);
+
+      const spawning = await fixture.spawningExecution();
+      assert.equal(await fixture.lifecycle.steer(spawning, "activity-3", "later"), "agent_pending");
+      await fixture.database.transitionAgentExecution(spawning, "failed", { result: {} });
+      assert.equal(await fixture.lifecycle.steer(spawning, "activity-4", "late"), "not_live");
+      assert.equal(await fixture.lifecycle.steer("missing", "activity-5", "none"), "not_live");
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+
+  it("interrupts without any Hub action, including before the agent exists", async () => {
+    const fixture = await controlFixture({ autoArchive: true });
+    try {
+      assert.equal(await fixture.lifecycle.interrupt(EXECUTION_ID, "linear_stop_requested"), true);
+      assert.deepEqual(fixture.connection.actions, ["interrupt"]);
+      const stopped = await fixture.database.findAgentExecutionById(EXECUTION_ID);
+      assert.equal(stopped?.status, "failed");
+      assert.equal(stopped?.hubAction, null);
+      assert.deepEqual(stopped?.result, { status: "failed", reason: "linear_stop_requested" });
+      assert.deepEqual(fixture.failures, ["linear_stop_requested"]);
+      assert.equal(await fixture.lifecycle.interrupt(EXECUTION_ID, "linear_stop_requested"), false);
+
+      const spawning = await fixture.spawningExecution({ autoArchive: true });
+      assert.equal(await fixture.lifecycle.interrupt(spawning, "linear_session_dismissed"), true);
+      assert.deepEqual(fixture.connection.actions, ["interrupt"]);
+      const canceled = await fixture.database.findAgentExecutionById(spawning);
+      assert.equal(canceled?.status, "failed");
+      assert.equal(canceled?.hubAction, null);
+      assert.deepEqual(canceled?.result, { status: "failed", reason: "linear_session_dismissed" });
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+
+  it("answers permissions only through a daemon allowed to write workspaces", async () => {
+    const fixture = await controlFixture();
+    const response = { behavior: "allow" as const, selectedActionId: "allow" };
+    try {
+      fixture.settings.permissions = ["hub.execute"];
+      assert.equal(
+        await fixture.lifecycle.respondToPermission(EXECUTION_ID, "perm-1", response),
+        "permission_missing",
+      );
+      assert.deepEqual(fixture.connection.answers, []);
+
+      fixture.settings.permissions = ["hub.execute", "workspace.write"];
+      assert.equal(
+        await fixture.lifecycle.respondToPermission(EXECUTION_ID, "perm-1", response),
+        "resolved",
+      );
+      assert.deepEqual(fixture.connection.answers, [
+        { agentId: AGENT_ID, requestId: "perm-1", response },
+      ]);
+
+      fixture.connection.answer = () => {
+        throw new DaemonAgentError("Request failed: permission is already being submitted", {
+          code: "handler_error",
+        });
+      };
+      assert.deepEqual(
+        await fixture.lifecycle.respondToPermission(EXECUTION_ID, "perm-1", response),
+        { status: "rejected", error: "Request failed: permission is already being submitted" },
+      );
+
+      fixture.connection.answer = () => "unconfirmed";
+      assert.equal(
+        await fixture.lifecycle.respondToPermission(EXECUTION_ID, "perm-1", response),
+        "unconfirmed",
+      );
+
+      fixture.settings.reachable = false;
+      assert.equal(
+        await fixture.lifecycle.respondToPermission(EXECUTION_ID, "perm-1", response),
+        "unconfirmed",
+      );
+      fixture.settings.reachable = true;
+
+      const spawning = await fixture.spawningExecution();
+      assert.equal(
+        await fixture.lifecycle.respondToPermission(spawning, "perm-1", response),
+        "not_live",
+      );
+      await fixture.database.transitionAgentExecution(EXECUTION_ID, "succeeded");
+      assert.equal(
+        await fixture.lifecycle.respondToPermission(EXECUTION_ID, "perm-1", response),
+        "not_live",
+      );
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+
+  it("reads the session workspace's pull request and the daemon's permissions", async () => {
+    const fixture = await controlFixture();
+    try {
+      assert.equal(await fixture.lifecycle.readWorkspacePullRequest(EXECUTION_ID), undefined);
+      fixture.connection.pullRequest = { url: "https://github.com/acme/repo/pull/9", title: "Fix" };
+      assert.deepEqual(await fixture.lifecycle.readWorkspacePullRequest(EXECUTION_ID), {
+        url: "https://github.com/acme/repo/pull/9",
+        title: "Fix",
+      });
+      assert.deepEqual(fixture.connection.workspaceReads, [
+        "workspace-control",
+        "workspace-control",
+      ]);
+      assert.equal(await fixture.lifecycle.readWorkspacePullRequest("missing"), undefined);
+
+      fixture.settings.permissions = ["hub.execute", "workspace.write"];
+      assert.deepEqual(await fixture.lifecycle.daemonPermissions(DAEMON_ID), [
+        "hub.execute",
+        "workspace.write",
+      ]);
+      assert.deepEqual(await fixture.lifecycle.daemonPermissions("unknown"), []);
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+});
+
+function settle(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+}
+
+function controlIntent(overrides: Partial<LaunchMachineIntent> = {}): LaunchMachineIntent {
+  return {
+    kind: "launch_machine",
+    organizationId: "org-control",
+    projectId: "project-control",
+    triggerRunId: "run-control",
+    triggerName: "control",
+    environmentName: "runner",
+    environment: { kind: "daemon", daemonId: DAEMON_ID, authoredSlug: "daemon", cwd: "/repo" },
+    agent: { provider: "codex" },
+    prompt: "Work on the issue",
+    allowOutputs: [],
+    autoArchive: false,
+    triggerContext: { provider: "test" },
+    outputContext: { provider: "test", arrival: 1 },
+    configurationRevisionId: "revision-control",
+    hubConfig: {},
+    ...overrides,
+  };
+}
+
+/** A daemon double whose agent, workspace and permission answers the tests configure. */
+class ControlConnection implements DaemonConnection {
+  readonly sends: { agentId: string; messageId: string; text: string }[] = [];
+  readonly actions: string[] = [];
+  readonly answers: { agentId: string; requestId: string; response: unknown }[] = [];
+  readonly workspaceReads: string[] = [];
+  pendingPermissions: { id: string }[] = [];
+  pullRequest: { url: string; title: string } | undefined;
+  answer: () => "resolved" | "unconfirmed" = () => "resolved";
+  private readonly listeners = new Set<(event: AgentEvent) => void>();
+  readonly agents: AgentConnection = {
+    create: async () => this.snapshot(),
+    get: async () => this.snapshot(),
+    send: async (agentId, messageId, text) => {
+      this.sends.push({ agentId, messageId, text });
+    },
+    restore: async () => true,
+    control: async (_agentId, _workspaceId, action) => {
+      this.actions.push(action);
+    },
+    inspectWorkspace: async () => ({ kind: "active" }),
+    readWorkspace: async (workspaceId) => {
+      this.workspaceReads.push(workspaceId);
+      return {
+        id: workspaceId,
+        githubRuntime: this.pullRequest === undefined ? null : { pullRequest: this.pullRequest },
+      };
+    },
+    respondToPermission: async (agentId, requestId, response) => {
+      this.answers.push({ agentId, requestId, response });
+      return this.answer();
+    },
+    watch: async (_agentId, listener) => {
+      this.listeners.add(listener);
+      return () => this.listeners.delete(listener);
+    },
+  };
+  emit(event: AgentEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
+  private snapshot() {
+    return {
+      id: AGENT_ID,
+      workspaceId: "workspace-control",
+      status: "idle" as const,
+      pendingPermissions: this.pendingPermissions,
+    };
+  }
+  async getProviderSnapshot(): Promise<never> {
+    throw new Error("not used");
+  }
+  async refreshProviderSnapshot(): Promise<never> {
+    throw new Error("not used");
+  }
+}
+
+async function dispatchedFixture(
+  options: { streamFailure?: string; dispatchFailure?: string } = {},
+) {
+  const database = createMemoryDatabase();
+  const stream = new FailureLogStream();
+  const connection = new ControlConnection();
+  const dispatched: AgentDispatchNotification[] = [];
+  const streamed: AgentStreamNotification[] = [];
+  /** The stream hook waits on this before returning, so a test can hold it open. */
+  const gate = { hook: Promise.resolve() };
+  const provider: TriggerProvider = {
+    name: "test",
+    eventNames: ["manual.test"],
+    match: () => Promise.resolve([]),
+    onAgentDispatched: async (input) => {
+      if (options.dispatchFailure !== undefined) throw new Error(options.dispatchFailure);
+      dispatched.push(input);
+    },
+    onAgentStreamEvent: async (input) => {
+      if (options.streamFailure !== undefined) throw new Error(options.streamFailure);
+      streamed.push(input);
+      await gate.hook;
+    },
+  };
+  const intent = controlIntent();
+  await database.insertAgentExecution({
+    id: EXECUTION_ID,
+    organizationId: intent.organizationId,
+    projectId: intent.projectId,
+    machineId: null,
+    daemonId: DAEMON_ID,
+    triggerContext: intent.triggerContext,
+    outputContext: intent.outputContext,
+    configurationRevisionId: intent.configurationRevisionId,
+    launchIntent: intent,
+  });
+  const lifecycle = createDaemonDispatchLifecycle({
+    database,
+    connectionForDaemon: () => connection,
+    publicBaseUrl: "https://hub.test",
+    completionTokenSecret: "test-secret",
+    providers: [provider],
+    test: { logger: createLogger(stream) },
+  });
+  await lifecycle.recoverDaemon(daemonRecord());
+  await settle();
+  return { database, stream, connection, dispatched, streamed, gate, lifecycle };
+}
+
+async function controlFixture(overrides: Partial<LaunchMachineIntent> = {}) {
+  const database = createMemoryDatabase();
+  const connection = new ControlConnection();
+  const failures: string[] = [];
+  /** What the daemon record and registry report; tests change it between calls. */
+  const settings = { permissions: ["hub.execute"], reachable: true };
+  const spawningExecution = async (intentOverrides: Partial<LaunchMachineIntent> = {}) => {
+    const intent = controlIntent(intentOverrides);
+    const execution = await database.insertAgentExecution({
+      organizationId: intent.organizationId,
+      projectId: intent.projectId,
+      machineId: null,
+      daemonId: DAEMON_ID,
+      triggerContext: intent.triggerContext,
+      outputContext: intent.outputContext,
+      configurationRevisionId: intent.configurationRevisionId,
+      launchIntent: intent,
+    });
+    return execution.id;
+  };
+  const intent = controlIntent(overrides);
+  await database.insertAgentExecution({
+    id: EXECUTION_ID,
+    organizationId: intent.organizationId,
+    projectId: intent.projectId,
+    machineId: null,
+    daemonId: DAEMON_ID,
+    triggerContext: intent.triggerContext,
+    outputContext: intent.outputContext,
+    configurationRevisionId: intent.configurationRevisionId,
+    launchIntent: intent,
+  });
+  await database.saveAgentSession({
+    id: "session-control",
+    organizationId: intent.organizationId,
+    projectId: intent.projectId,
+    continuationKey: "linear:session:1",
+    workspaceKey: "linear:issue:1",
+    workspaceResolution: null,
+    daemonId: DAEMON_ID,
+    agentId: AGENT_ID,
+    workspaceId: "workspace-control",
+    compatibility: "test",
+    capabilityTokenHash: "test",
+    tools: [],
+    creationOptions: { provider: "codex", cwd: "/repo", env: {}, toolPolicy: { preapproved: [] } },
+  });
+  await database.attachExecutionToSession(EXECUTION_ID, "session-control", "created");
+  await database.attachAgentToExecution(EXECUTION_ID, DAEMON_ID, AGENT_ID);
+  await database.transitionAgentExecution(EXECUTION_ID, "running");
+  vi.spyOn(database, "findDaemonById").mockImplementation(async (id) =>
+    id === DAEMON_ID ? { ...daemonRecord(), permissions: settings.permissions } : undefined,
+  );
+  const lifecycle = createDaemonDispatchLifecycle({
+    database,
+    connectionForDaemon: () => (settings.reachable ? connection : undefined),
+    publicBaseUrl: "https://hub.test",
+    completionTokenSecret: "test-secret",
+    providers: [
+      {
+        name: "test",
+        eventNames: ["manual.test"],
+        match: () => Promise.resolve([]),
+        onAgentExecutionFailed: async (_triggerContext, _outputContext, reason) => {
+          failures.push(reason);
+        },
+      },
+    ],
+  });
+  return { database, connection, failures, settings, lifecycle, spawningExecution };
 }

@@ -24,6 +24,7 @@ import type {
 import { parseProviderApplicationConfiguration } from "./store.js";
 import type { SlackDeliveryStatus } from "../../triggers/slack/source/index.js";
 import { GITHUB_TRIGGER_SOURCE_NAMES } from "../../triggers/github/classification.js";
+import type { ExecutionControl } from "../../daemons/execution-control.js";
 
 interface Slot {
   active: ActiveRegistration | undefined;
@@ -65,6 +66,8 @@ interface DynamicProviderRuntimeOptions {
   database: Database;
   auth: AuthServer;
   applicationBaseUrl: string;
+  /** Shared by every activation: registrations rebuilt on reconfiguration keep the same control. */
+  executionControl: ExecutionControl;
   fetch?: typeof fetch;
   registrationFactory?: (input: {
     provider: Provider;
@@ -228,6 +231,7 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       applicationBaseUrl: this.options.applicationBaseUrl,
       publicBaseUrl: callbackOrigin,
       configurationVersion,
+      executionControl: this.options.executionControl,
       ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
     };
     if (provider === "github" && configuration.provider === "github") {
@@ -524,6 +528,10 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
           (trigger) =>
             trigger.onAgentExecutionTerminal?.(executionId, triggerContext) ?? Promise.resolve(),
         ),
+      onAgentDispatched: (input) =>
+        invoke((trigger) => trigger.onAgentDispatched?.(input) ?? Promise.resolve()),
+      onAgentStreamEvent: (input) =>
+        invoke((trigger) => trigger.onAgentStreamEvent?.(input) ?? Promise.resolve()),
       onMachineTerminated: (triggerContext, reason, reactionState) =>
         invoke(
           (trigger) =>

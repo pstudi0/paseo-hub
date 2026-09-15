@@ -7,16 +7,56 @@ import {
 import type { DaemonCreateAgentOptions, DaemonAgentStreamEvent } from "../protocol.js";
 import { DaemonResponseLostError } from "../protocol.js";
 
+/** How long a permission answer waits for the daemon to confirm it before reporting "unconfirmed". */
+export const PERMISSION_CONFIRM_MS = 30_000;
+const WORKSPACE_PAGE_SIZE = 200;
+
 const SnapshotSchema = z.object({
   id: z.string(),
   workspaceId: z.string(),
   status: HubExecutionAgentSnapshotSchema.shape.status,
   archivedAt: z.unknown().optional(),
+  pendingPermissions: z.array(z.object({ id: z.string() }).passthrough()).default([]),
 });
 export type AgentSnapshot = z.infer<typeof SnapshotSchema>;
 export type AgentEvent =
   | { type: "agent_update"; agent: AgentSnapshot; timestamp: string }
   | { type: "agent_stream"; agentId: string; event: DaemonAgentStreamEvent; timestamp: string };
+
+/** Mirrors Paseo's `AgentPermissionResponseSchema` (protocol `messages.ts`). */
+export type AgentPermissionResponse =
+  | {
+      behavior: "allow";
+      selectedActionId?: string;
+      updatedInput?: Record<string, unknown>;
+      updatedPermissions?: Record<string, unknown>[];
+    }
+  | { behavior: "deny"; selectedActionId?: string; message?: string; interrupt?: boolean };
+
+export type WorkspaceInspection =
+  | { kind: "active" }
+  | { kind: "archived" }
+  | { kind: "missing" }
+  | { kind: "unrecoverable"; reason: string };
+
+const WorkspaceSnapshotSchema = z
+  .object({
+    id: z.string(),
+    githubRuntime: z
+      .object({
+        pullRequest: z
+          .object({ url: z.string(), number: z.number().optional(), title: z.string() })
+          .passthrough()
+          .nullable()
+          .optional(),
+      })
+      .passthrough()
+      .nullable()
+      .optional(),
+  })
+  .passthrough();
+export type WorkspaceSnapshot = z.infer<typeof WorkspaceSnapshotSchema>;
+
 export interface AgentConnection {
   create(
     key: string,
@@ -26,7 +66,19 @@ export interface AgentConnection {
   get(agentId: string): Promise<AgentSnapshot>;
   send(agentId: string, messageId: string, text: string, timeoutMs?: number): Promise<void>;
   restore(workspaceId: string, timeoutMs?: number): Promise<boolean>;
-  control(agentId: string, workspaceId: string, action: "interrupt" | "archive"): Promise<void>;
+  control(
+    agentId: string,
+    workspaceId: string,
+    action: "interrupt" | "archive" | "archive_agent",
+  ): Promise<void>;
+  inspectWorkspace(workspaceId: string): Promise<WorkspaceInspection>;
+  readWorkspace(workspaceId: string): Promise<WorkspaceSnapshot | undefined>;
+  /** "unconfirmed" when neither the daemon's reply nor its stream confirmed the answer in time. */
+  respondToPermission(
+    agentId: string,
+    requestId: string,
+    response: AgentPermissionResponse,
+  ): Promise<"resolved" | "unconfirmed">;
   watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void>;
 }
 
@@ -40,8 +92,20 @@ const EnvelopeSchema = z.object({
 const ResultSchema = z
   .object({ error: z.string().nullable().optional(), accepted: z.boolean().optional() })
   .passthrough();
+const RecoveryStateSchema = z.object({ kind: z.string(), reason: z.string().optional() });
+const WorkspacePageSchema = z.object({
+  entries: z.array(z.unknown()),
+  pageInfo: z.object({ nextCursor: z.string().nullable() }).passthrough(),
+});
 
-export class DaemonAgentError extends Error {}
+export class DaemonAgentError extends Error {
+  /** The daemon's `rpc_error` code (`access_denied`, `handler_error`, ...) when it sent one. */
+  readonly code: string | undefined;
+  constructor(message: string, options: { code?: string } = {}) {
+    super(message);
+    this.code = options.code;
+  }
+}
 
 /** The ordinary daemon protocol. This channel knows nothing about Hub executions or triggers. */
 export class DaemonAgents implements AgentConnection {
@@ -72,8 +136,12 @@ export class DaemonAgents implements AgentConnection {
     const pending = typeof requestId === "string" ? this.pending.get(requestId) : undefined;
     if (pending) {
       if (type === "rpc_error" || payload["status"] === "agent_create_failed") {
+        const code = z.string().optional().catch(undefined).parse(payload["code"]);
         pending.reject(
-          new DaemonAgentError(z.string().catch("Daemon request rejected").parse(payload["error"])),
+          new DaemonAgentError(
+            z.string().catch("Daemon request rejected").parse(payload["error"]),
+            code === undefined ? {} : { code },
+          ),
         );
       } else pending.resolve(payload);
       return true;
@@ -130,6 +198,8 @@ export class DaemonAgents implements AgentConnection {
         },
         env: options.env,
         worktree: options.worktree,
+        ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
+        ...(options.labels === undefined ? {} : { labels: options.labels }),
       },
       timeoutMs,
     );
@@ -155,34 +225,98 @@ export class DaemonAgents implements AgentConnection {
       timeoutMs,
     );
   }
-  async restore(workspaceId: string, timeoutMs?: number): Promise<boolean> {
+  async inspectWorkspace(workspaceId: string): Promise<WorkspaceInspection> {
     const result = await this.request({ type: "workspace.recovery.inspect.request", workspaceId });
-    const state = z
-      .object({ kind: z.string(), reason: z.string().optional() })
-      .parse(result["state"]);
-    if (state.kind === "unavailable" && state.reason === "workspace_not_archived") return false;
-    if (state.kind !== "recoverable")
+    const state = RecoveryStateSchema.parse(result["state"]);
+    if (state.kind === "recoverable") return { kind: "archived" };
+    if (state.reason === "workspace_not_archived") return { kind: "active" };
+    if (state.reason === "workspace_not_found") return { kind: "missing" };
+    return { kind: "unrecoverable", reason: state.reason ?? state.kind };
+  }
+  async restore(workspaceId: string, timeoutMs?: number): Promise<boolean> {
+    const inspection = await this.inspectWorkspace(workspaceId);
+    if (inspection.kind === "active") return false;
+    if (inspection.kind !== "archived")
       throw new DaemonAgentError(
         "Workspace cannot be restored; inspect its recovery state in Paseo",
       );
     await this.request({ type: "workspace.recovery.restore.request", workspaceId }, timeoutMs);
     return true;
   }
+  async readWorkspace(workspaceId: string): Promise<WorkspaceSnapshot | undefined> {
+    let cursor: string | undefined;
+    do {
+      const result = await this.request({
+        type: "fetch_workspaces_request",
+        page: { limit: WORKSPACE_PAGE_SIZE, ...(cursor === undefined ? {} : { cursor }) },
+        sort: [{ key: "activity_at", direction: "desc" }],
+      });
+      const page = WorkspacePageSchema.parse(result);
+      for (const entry of page.entries) {
+        const workspace = WorkspaceSnapshotSchema.safeParse(entry);
+        if (workspace.success && workspace.data.id === workspaceId) return workspace.data;
+      }
+      cursor = page.pageInfo.nextCursor ?? undefined;
+    } while (cursor !== undefined);
+    return undefined;
+  }
   async control(
     agentId: string,
     workspaceId: string,
-    action: "interrupt" | "archive",
+    action: "interrupt" | "archive" | "archive_agent",
   ): Promise<void> {
+    if (action === "archive") {
+      await this.request({ type: "archive_workspace_request", workspaceId });
+      return;
+    }
     await this.request(
-      action === "archive"
-        ? { type: "archive_workspace_request", workspaceId }
+      action === "archive_agent"
+        ? { type: "archive_agent_request", agentId }
         : { type: "cancel_agent_request", agentId },
     );
   }
+  /**
+   * The daemon correlates its answer on this frame's `requestId`: `agent_permission_resolved`
+   * (modern sockets) or `rpc_error` on refusal, and every socket also streams `permission_resolved`
+   * for the agent. Either confirmation resolves; silence past the deadline is "unconfirmed".
+   */
+  async respondToPermission(
+    agentId: string,
+    requestId: string,
+    response: AgentPermissionResponse,
+  ): Promise<"resolved" | "unconfirmed"> {
+    let unlisten = (): void => {};
+    const observed = new Promise<"resolved">((resolve) => {
+      unlisten = this.listen(agentId, (event) => {
+        if (
+          event.type === "agent_stream" &&
+          event.event.type === "permission_resolved" &&
+          event.event.requestId === requestId
+        )
+          resolve("resolved");
+      });
+    });
+    const replied = this.request(
+      { type: "agent_permission_response", agentId, requestId, response },
+      PERMISSION_CONFIRM_MS,
+      requestId,
+    ).then(
+      () => "resolved" as const,
+      (error: unknown) => {
+        if (error instanceof DaemonResponseLostError) return "unconfirmed" as const;
+        throw error;
+      },
+    );
+    // The stream may confirm first; the reply's later rejection must not surface unhandled.
+    replied.catch(() => undefined);
+    try {
+      return await Promise.race([observed, replied]);
+    } finally {
+      unlisten();
+    }
+  }
   async watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void> {
-    const listeners = this.listeners.get(agentId) ?? new Set();
-    listeners.add(listener);
-    this.listeners.set(agentId, listeners);
+    const unlisten = this.listen(agentId, listener);
     try {
       if (!this.observing) {
         await this.request({
@@ -196,12 +330,19 @@ export class DaemonAgents implements AgentConnection {
         agentIds: [...this.listeners.keys()],
       });
     } catch (error) {
-      listeners.delete(listener);
+      unlisten();
       throw error;
     }
+    return unlisten;
+  }
+  private listen(agentId: string, listener: (event: AgentEvent) => void): () => void {
+    const listeners = this.listeners.get(agentId) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(agentId, listeners);
     return () => {
       listeners.delete(listener);
-      if (listeners.size === 0) this.listeners.delete(agentId);
+      if (listeners.size === 0 && this.listeners.get(agentId) === listeners)
+        this.listeners.delete(agentId);
     };
   }
   private emit(agentId: string, event: AgentEvent): void {
@@ -210,9 +351,9 @@ export class DaemonAgents implements AgentConnection {
   private async request(
     message: Record<string, unknown>,
     timeoutMs = 30_000,
+    requestId: string = randomUUID(),
   ): Promise<Record<string, unknown>> {
     if (!this.supported) throw new DaemonAgentError("Update the Paseo daemon to run Hub agents");
-    const requestId = randomUUID();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const result = await new Promise<Record<string, unknown>>((resolve, reject) => {

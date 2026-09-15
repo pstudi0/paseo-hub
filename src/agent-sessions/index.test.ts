@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { AgentSessions } from "./index.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { OutputExecutorRegistry, replyOutputTool } from "../execution-capabilities/outputs.js";
 import { createExecutionCapabilityServer } from "../execution-capabilities/server.js";
-import type { AgentConnection, AgentSnapshot } from "../daemons/agents/index.js";
+import type {
+  AgentConnection,
+  AgentSnapshot,
+  WorkspaceInspection,
+} from "../daemons/agents/index.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { DaemonCreateAgentOptions } from "../daemons/protocol.js";
 
@@ -13,11 +17,27 @@ class TestAgents implements AgentConnection {
   readonly deliveries: { agentId: string; text: string }[] = [];
   readonly creates: DaemonCreateAgentOptions[] = [];
   readonly messages = new Set<string>();
+  /** Daemon-side workspace state; a workspace unknown here is "missing". */
+  readonly workspaces = new Map<string, WorkspaceInspection>();
+  readonly inspections: string[] = [];
+  readonly actions: string[] = [];
   archives = 0;
   restorations = 0;
   async create(_key: string, options: DaemonCreateAgentOptions) {
     this.creates.push(options);
-    const agent = { id: randomUUID(), workspaceId: randomUUID(), status: "idle" as const };
+    if (
+      options.workspaceId !== undefined &&
+      this.workspaces.get(options.workspaceId)?.kind !== "active"
+    )
+      throw new Error(`Workspace ${options.workspaceId} not found`);
+    const workspaceId = options.workspaceId ?? randomUUID();
+    this.workspaces.set(workspaceId, { kind: "active" });
+    const agent = {
+      id: randomUUID(),
+      workspaceId,
+      status: "idle" as const,
+      pendingPermissions: [],
+    };
     this.agents.set(agent.id, agent);
     return agent;
   }
@@ -36,17 +56,33 @@ class TestAgents implements AgentConnection {
   }
   async restore(workspaceId: string) {
     this.restorations++;
+    this.workspaces.set(workspaceId, { kind: "active" });
     for (const [id, agent] of this.agents)
       if (agent.workspaceId === workspaceId) this.agents.set(id, { ...agent, archivedAt: null });
     return true;
   }
-  async control(agentId: string, _workspaceId: string, action: "interrupt" | "archive") {
+  async inspectWorkspace(workspaceId: string) {
+    this.inspections.push(workspaceId);
+    return this.workspaces.get(workspaceId) ?? { kind: "missing" as const };
+  }
+  async readWorkspace() {
+    return undefined;
+  }
+  async respondToPermission() {
+    return "resolved" as const;
+  }
+  async control(
+    agentId: string,
+    workspaceId: string,
+    action: "interrupt" | "archive" | "archive_agent",
+  ) {
+    this.actions.push(action);
     if (action === "archive") {
       this.archives++;
-      this.agents.set(agentId, {
-        ...(await this.get(agentId)),
-        archivedAt: new Date().toISOString(),
-      });
+      this.workspaces.set(workspaceId, { kind: "archived" });
+      for (const [id, agent] of this.agents)
+        if (agent.workspaceId === workspaceId)
+          this.agents.set(id, { ...agent, archivedAt: new Date().toISOString() });
     }
   }
 }
@@ -123,10 +159,32 @@ async function fixture(now = Date.now) {
             cwd: "/repo",
             env: intent.github === undefined ? {} : { GH_TOKEN: "scoped-github-token" },
             toolPolicy: { preapproved: [] },
+            ...(intent.environment.worktree === undefined
+              ? {}
+              : { worktree: intent.environment.worktree }),
           }),
         }),
     };
   }
+  /** A Linear-style arrival: its own session key, a workspace key shared by the issue. */
+  function issueArrival(
+    sessionKey: string,
+    workspaceKey = "linear:issue:issue-1",
+    overrides: Partial<LaunchMachineIntent> = {},
+  ) {
+    return arrival(sessionKey, "daemon", {}, "work on the issue", {
+      continuation: { key: sessionKey, workspaceKey, compatibility: { target: "daemon" } },
+      environment: {
+        kind: "daemon",
+        daemonId: "daemon",
+        authoredSlug: "daemon",
+        cwd: "/repo",
+        worktree: { mode: "branch-off", newBranch: "linear/ENG-1", base: "main" },
+      },
+      ...overrides,
+    });
+  }
+  return { database, connection, sessions, replies, arrival, issueArrival, execution, call };
   async function execution(id: string) {
     const item = await database.findAgentExecutionById(id);
     if (!item) throw new Error("missing execution");
@@ -161,7 +219,6 @@ async function fixture(now = Date.now) {
     const result: unknown = await response.json();
     return result;
   }
-  return { database, connection, sessions, replies, arrival, execution, call };
 }
 
 test("same-key arrivals share an agent; an earlier completion cannot archive newer work", async () => {
@@ -306,4 +363,191 @@ test("a ping cannot send more work after the inherited deadline while timeout cl
   });
   await expect(next.dispatch()).rejects.toThrow("execution_deadline_exceeded");
   expect(f.connection.deliveries).toHaveLength(1);
+});
+
+test("sessions sharing a workspace key create later agents inside the first agent's workspace", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  const opened = await first.dispatch();
+  expect(opened).toMatchObject({ action: "created", workspace: { action: "created" } });
+  expect(f.connection.creates[0]).toMatchObject({
+    worktree: { mode: "branch-off", newBranch: "linear/ENG-1", base: "main" },
+    labels: {
+      "hub.workspace-key": "linear:issue:issue-1",
+      "hub.continuation-key": "linear:session:1",
+    },
+  });
+  expect(f.connection.creates[0]).not.toHaveProperty("workspaceId");
+
+  const second = await f.issueArrival("linear:session:2");
+  const joined = await second.dispatch();
+  expect(joined.agentId).not.toBe(opened.agentId);
+  expect(joined.workspaceId).toBe(opened.workspaceId);
+  expect(joined).toMatchObject({ action: "created", workspace: { action: "reused" } });
+  expect(f.connection.creates[1]).toMatchObject({
+    workspaceId: opened.workspaceId,
+    labels: {
+      "hub.workspace-key": "linear:issue:issue-1",
+      "hub.continuation-key": "linear:session:2",
+    },
+  });
+  expect(f.connection.creates[1]).not.toHaveProperty("worktree");
+  expect(f.connection.inspections).toEqual([opened.workspaceId]);
+  const conversation = await f.arrival("conversation");
+  await conversation.dispatch();
+  expect(f.connection.creates[2]).toMatchObject({
+    labels: { "hub.continuation-key": "conversation" },
+  });
+  expect(f.connection.creates[2]).not.toHaveProperty("labels.hub.workspace-key");
+  const plain = await f.arrival(false);
+  await plain.dispatch();
+  expect(f.connection.creates[3]).not.toHaveProperty("labels");
+});
+
+test("an archived issue workspace is restored before the next agent is created in it", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  const opened = await first.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  await f.sessions.control(await f.execution(first.executionId), f.connection, "archive");
+  expect(f.connection.archives).toBe(1);
+
+  const second = await f.issueArrival("linear:session:2");
+  const restored = await second.dispatch();
+  expect(restored).toMatchObject({
+    workspaceId: opened.workspaceId,
+    action: "created",
+    workspace: { action: "restored" },
+  });
+  expect(f.connection.restorations).toBe(1);
+  expect(f.connection.creates[1]).toMatchObject({ workspaceId: opened.workspaceId });
+});
+
+test("a missing issue workspace is replaced by a fresh worktree", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  const opened = await first.dispatch();
+  f.connection.workspaces.delete(opened.workspaceId);
+
+  const second = await f.issueArrival("linear:session:2");
+  const recreated = await second.dispatch();
+  expect(recreated.workspaceId).not.toBe(opened.workspaceId);
+  expect(recreated).toMatchObject({ action: "created", workspace: { action: "created" } });
+  expect(f.connection.creates[1]).toMatchObject({ worktree: { mode: "branch-off" } });
+  expect(f.connection.creates[1]).not.toHaveProperty("workspaceId");
+});
+
+test("an unrecoverable issue workspace is recreated and the daemon's reason surfaces", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  const opened = await first.dispatch();
+  f.connection.workspaces.set(opened.workspaceId, {
+    kind: "unrecoverable",
+    reason: "worktree_branch_missing",
+  });
+
+  const second = await f.issueArrival("linear:session:2");
+  const recreated = await second.dispatch();
+  expect(recreated.workspaceId).not.toBe(opened.workspaceId);
+  expect(recreated.workspace).toEqual({
+    action: "recreated",
+    unrecoverableReason: "worktree_branch_missing",
+  });
+  expect(f.connection.restorations).toBe(0);
+  expect(f.connection.creates[1]).toMatchObject({ worktree: { mode: "branch-off" } });
+});
+
+test("a completed credentialed issue session gets a fresh agent in the same workspace", async () => {
+  const f = await fixture();
+  const github = {
+    connection: "getpaseo-github",
+    repositories: ["getpaseo/paseo"],
+    permissions: { contents: "write" as const },
+    durationMs: 60 * 60 * 1000,
+  };
+  const first = await f.issueArrival("linear:session:1", "linear:issue:issue-1", { github });
+  const original = await first.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  await f.sessions.releaseAuthority(await f.execution(first.executionId), async () => {});
+
+  const followUp = await f.issueArrival("linear:session:1", "linear:issue:issue-1", { github });
+  const fresh = await followUp.dispatch();
+  expect(fresh.agentId).not.toBe(original.agentId);
+  expect(fresh.workspaceId).toBe(original.workspaceId);
+  expect(fresh).toMatchObject({ action: "created", workspace: { action: "reused" } });
+  expect(f.connection.creates).toHaveLength(2);
+  expect(f.connection.creates[1]).toMatchObject({ workspaceId: original.workspaceId });
+});
+
+test("the workspace choice is persisted before creation so a replayed dispatch repeats the same request", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  await first.dispatch();
+  const save = f.database.saveAgentSession.bind(f.database);
+  let lost = false;
+  vi.spyOn(f.database, "saveAgentSession").mockImplementation(async (session) => {
+    if (!lost && session.agentId !== null && session.continuationKey === "linear:session:2") {
+      lost = true;
+      throw new Error("connection reset after the daemon created the agent");
+    }
+    await save(session);
+  });
+
+  const second = await f.issueArrival("linear:session:2");
+  await expect(second.dispatch()).rejects.toThrow("connection reset");
+  expect(f.connection.creates).toHaveLength(2);
+  const inspections = f.connection.inspections.length;
+
+  const replayed = await second.dispatch();
+  expect(f.connection.creates).toHaveLength(3);
+  expect(f.connection.creates[2]).toEqual(f.connection.creates[1]);
+  expect(f.connection.inspections).toHaveLength(inspections);
+  expect(replayed).toMatchObject({ action: "created", workspace: { action: "reused" } });
+  const session = await f.database.findAgentSession(
+    (await f.execution(second.executionId)).agentSessionId!,
+  );
+  expect(session?.workspaceResolution).toMatchObject({ action: "reused" });
+});
+
+test("every session of a workspace key serializes on the workspace lock, in dispatch and control alike", async () => {
+  const f = await fixture();
+  const locks: string[] = [];
+  const withLock = f.database.withAdvisoryLock.bind(f.database);
+  vi.spyOn(f.database, "withAdvisoryLock").mockImplementation((key, fn) => {
+    locks.push(key);
+    return withLock(key, fn);
+  });
+  const first = await f.issueArrival("linear:session:1");
+  await first.dispatch();
+  const second = await f.issueArrival("linear:session:2");
+  await second.dispatch();
+  const other = await f.issueArrival("linear:session:3", "linear:issue:issue-2");
+  await other.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  await f.sessions.control(await f.execution(first.executionId), f.connection, "archive");
+  await f.sessions.releaseAuthority(await f.execution(first.executionId), async () => {});
+
+  const [dispatchOne, dispatchTwo, dispatchOther, control, release] = locks;
+  expect(dispatchOne).toBe(dispatchTwo);
+  expect(dispatchOther).not.toBe(dispatchOne);
+  expect(control).toBe(dispatchOne);
+  expect(release).toBe(dispatchOne);
+  expect(locks).toHaveLength(5);
+});
+
+test("archiving a finished issue session keeps the workspace while a sibling session still works", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  await first.dispatch();
+  const second = await f.issueArrival("linear:session:2");
+  await second.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  await f.sessions.control(await f.execution(first.executionId), f.connection, "archive");
+  expect(f.connection.actions).toEqual(["archive_agent"]);
+  expect(f.connection.archives).toBe(0);
+
+  await f.database.transitionAgentExecution(second.executionId, "succeeded");
+  await f.sessions.control(await f.execution(second.executionId), f.connection, "archive");
+  expect(f.connection.actions).toEqual(["archive_agent", "archive"]);
+  expect(f.connection.archives).toBe(1);
 });

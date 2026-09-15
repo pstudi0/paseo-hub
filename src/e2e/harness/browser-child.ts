@@ -2,6 +2,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { createApplicationRuntime } from "../../application-runtime.js";
+import {
+  createDeferredExecutionControl,
+  type DeferredExecutionControl,
+} from "../../daemons/execution-control.js";
 import { createAuthServer, type AuthServer, type AuthServerOptions } from "../../auth/server.js";
 import { composeBilling, type BillingConfig, type BillingRuntime } from "../../billing/index.js";
 import { composeEntitlements } from "../../auth/entitlements.js";
@@ -282,6 +286,7 @@ async function main(): Promise<void> {
             configuration: null,
           }),
         ];
+  const executionControl = createDeferredExecutionControl();
   const providers = await providerRuntimeOptions(auth, registrations, {
     database,
     databaseRuntime,
@@ -292,6 +297,7 @@ async function main(): Promise<void> {
     slackBot,
     slackSocket,
     githubConfiguration,
+    executionControl,
   });
   const runtime = await createApplicationRuntime({
     database,
@@ -299,6 +305,7 @@ async function main(): Promise<void> {
     entitlements: entitlements.service,
     billing,
     ...providers,
+    executionControl,
     publicBaseUrl,
     completionTokenSecret: requiredEnvironment("PASEO_HUB_AUTH_SECRET"),
     async close() {
@@ -1199,6 +1206,7 @@ async function composeProviderApplications(input: {
   slackBot: BrowserSlackBot;
   slackSocket: BrowserSlackSocketFixture;
   githubConfiguration: BrowserGitHubConfiguration;
+  executionControl: DeferredExecutionControl;
 }): Promise<{
   capability: ProviderApplications;
   registrations: readonly ProviderRegistration[];
@@ -1212,6 +1220,7 @@ async function composeProviderApplications(input: {
     database: input.database,
     auth: input.auth,
     applicationBaseUrl: input.publicBaseUrl,
+    executionControl: input.executionControl,
     registrationFactory: browserRegistrationFactory({
       database: input.database,
       auth: input.auth,

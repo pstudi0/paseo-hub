@@ -3649,11 +3649,15 @@ function slackDropReason(
   return undefined;
 }
 
-/** Sessions saved before `workspaceKey` existed read back with `null`, as in Postgres. */
+/** Sessions saved before the workspace fields existed read back with `null`, as in Postgres. */
 function cloneAgentSession(
   session: import("../agent-sessions/index.js").AgentSessionRecord,
 ): import("../agent-sessions/index.js").AgentSessionRecord {
-  return { ...structuredClone(session), workspaceKey: session.workspaceKey ?? null };
+  return {
+    ...structuredClone(session),
+    workspaceKey: session.workspaceKey ?? null,
+    workspaceResolution: session.workspaceResolution ?? null,
+  };
 }
 
 function linearDropReason(

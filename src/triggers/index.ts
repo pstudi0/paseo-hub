@@ -1,6 +1,7 @@
 import type { DurableProviderEvent } from "../db/types.js";
 import type { JsonValue } from "../config/compiler.js";
 import type { WorktreeTarget } from "../config/index.js";
+import type { HubExecutionAgentStreamEvent } from "../hub/protocol.js";
 import type { InvocationParseResult } from "./invocation.js";
 import type { ProviderEventDropReasonCode } from "./drop-reason.js";
 
@@ -129,6 +130,39 @@ export function asTriggerContextValue(value: unknown): JsonValue {
   return value;
 }
 
+/** One daemon stream event of a live execution, observed for the agent the execution owns. */
+export interface AgentStreamNotification<TriggerContext = unknown, OutputContext = TriggerContext> {
+  executionId: string;
+  agentId: string;
+  daemonId: string;
+  triggerContext: TriggerContext;
+  outputContext: OutputContext;
+  event: HubExecutionAgentStreamEvent;
+  observedAt: Date;
+}
+
+/** The daemon agent and workspace an execution was delivered to, once the prompt is sent. */
+export interface AgentDispatchNotification<
+  TriggerContext = unknown,
+  OutputContext = TriggerContext,
+> {
+  executionId: string;
+  daemonId: string;
+  agentId: string;
+  workspaceId: string;
+  action: "created" | "continued" | "restored";
+  workspace: {
+    action: "created" | "reused" | "restored" | "recreated";
+    unrecoverableReason?: string;
+  };
+  triggerContext: TriggerContext;
+  outputContext: OutputContext;
+  /** Steers the live agent; `messageId` deduplicates redeliveries on the daemon. */
+  send(messageId: string, text: string): Promise<void>;
+  /** Cancels the agent's current turn without failing the execution. */
+  cancel(): Promise<void>;
+}
+
 export interface TriggerProvider<
   Name extends string = string,
   TriggerContext = unknown,
@@ -167,6 +201,12 @@ export interface TriggerProvider<
     reactionState?: TriggerProviderReactionState,
   ): Promise<TriggerProviderReactionResult>;
   onAgentExecutionTerminal?(executionId: string, triggerContext: TriggerContext): Promise<void>;
+  /** Called after the prompt reaches the agent; never awaited by the dispatch path. */
+  onAgentDispatched?(
+    input: AgentDispatchNotification<TriggerContext, OutputContext>,
+  ): Promise<void>;
+  /** Called per stream event without blocking the daemon event chain; failures are reported. */
+  onAgentStreamEvent?(input: AgentStreamNotification<TriggerContext, OutputContext>): Promise<void>;
   onMachineTerminated?(
     triggerContext: TriggerContext,
     reason: string,

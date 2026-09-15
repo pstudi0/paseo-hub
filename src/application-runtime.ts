@@ -1,4 +1,5 @@
-import { createHubApplication } from "./app.js";
+import { createHubApplication, type HubRuntimeOptions } from "./app.js";
+import type { DeferredExecutionControl } from "./daemons/execution-control.js";
 import type { AuthServer } from "./auth/server.js";
 import type { BillingRuntime } from "./billing/index.js";
 import type { ConnectionResolver } from "./config/connections.js";
@@ -42,6 +43,8 @@ export interface ApplicationCompositionOptions {
   completionTokenSecret?: string;
   testTriggerRoutes?: boolean;
   daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
+  /** The deferred control already handed to the registrations' provider runtime, if any. */
+  executionControl?: DeferredExecutionControl;
   close(): Promise<void>;
 }
 
@@ -56,6 +59,26 @@ export async function createApplicationRuntime(
     await resources.close();
     throw error;
   }
+}
+
+function optionalHubApplicationOptions(
+  options: ApplicationCompositionOptions,
+): Pick<
+  HubRuntimeOptions,
+  "publicBaseUrl" | "completionTokenSecret" | "daemonConnectionForId" | "executionControl"
+> {
+  return {
+    ...(options.publicBaseUrl === undefined ? {} : { publicBaseUrl: options.publicBaseUrl }),
+    ...(options.completionTokenSecret === undefined
+      ? {}
+      : { completionTokenSecret: options.completionTokenSecret }),
+    ...(options.daemonConnectionForId === undefined
+      ? {}
+      : { daemonConnectionForId: options.daemonConnectionForId }),
+    ...(options.executionControl === undefined
+      ? {}
+      : { executionControl: options.executionControl }),
+  };
 }
 
 async function createOwnedApplicationRuntime(
@@ -104,14 +127,8 @@ async function createOwnedApplicationRuntime(
       options.auth?.publicCredentials === undefined
         ? { status: "unavailable" }
         : { status: "enabled", authenticator: options.auth.publicCredentials },
-    ...(options.publicBaseUrl === undefined ? {} : { publicBaseUrl: options.publicBaseUrl }),
-    ...(options.completionTokenSecret === undefined
-      ? {}
-      : { completionTokenSecret: options.completionTokenSecret }),
     outputRegistry,
-    ...(options.daemonConnectionForId === undefined
-      ? {}
-      : { daemonConnectionForId: options.daemonConnectionForId }),
+    ...optionalHubApplicationOptions(options),
   });
   ownership.own(() => application.hub.stop());
   await application.hub.start(registrations.flatMap((registration) => registration.sources));

@@ -12,6 +12,7 @@ import type {
   SlackProviderApplicationConfiguration,
 } from "../index.js";
 import { DynamicProviderRuntime } from "./runtime-owner.js";
+import { createDeferredExecutionControl } from "../../daemons/execution-control.js";
 import { OutputExecutorRegistry, replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { createGitHubReplyExecutor, githubReplyAvailable } from "../../triggers/github/reply.js";
 
@@ -22,6 +23,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: () => ({
         ...connectionRegistration("github", "A1"),
         outputs: [
@@ -96,6 +98,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ configuration }) =>
         downstreamRegistration(providerConfigurationId(configuration), [], []),
     });
@@ -110,6 +113,7 @@ describe("dynamic provider runtime", () => {
       connectionsForProject: () => {
         throw new Error("unused");
       },
+      executionControl: createDeferredExecutionControl(),
     })!;
 
     const candidate = await runtime.prepare(
@@ -133,6 +137,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ configuration }) =>
         fakeRegistration(configurationId(configuration), started, stopped, completed),
     });
@@ -157,6 +162,7 @@ describe("dynamic provider runtime", () => {
       connectionsForProject: () => {
         throw new Error("unused");
       },
+      executionControl: createDeferredExecutionControl(),
     })!;
     const matches = await trigger.match(externalTrigger());
     if (typeof matches === "string") throw new Error("expected a match");
@@ -190,6 +196,73 @@ describe("dynamic provider runtime", () => {
     assert.deepEqual(await response.json(), { url: "https://provider.test/A2" });
   });
 
+  it("relays dispatch and stream notifications to the active registration's trigger", async () => {
+    const notified: string[] = [];
+    const runtime = new DynamicProviderRuntime({
+      database: createMemoryDatabase(),
+      auth: testAuth(),
+      applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
+      registrationFactory: ({ configuration }) =>
+        observingRegistration(configurationId(configuration), notified),
+    });
+    const stable = runtime
+      .registrations()
+      .find((registration) => registration.connection.name === "slack")!;
+    await stable.sources[0]!.start(() => Promise.resolve());
+    const trigger = stable.triggerProviders[0]!({
+      configurationStoreForProject: () => {
+        throw new Error("unused");
+      },
+      connectionsForProject: () => {
+        throw new Error("unused");
+      },
+      executionControl: createDeferredExecutionControl(),
+    })!;
+    const first = await runtime.prepare(
+      "slack",
+      slackConfiguration("A1"),
+      "https://hub.test",
+      { provider: "slack", id: "A1", name: "A1" },
+      1,
+    );
+    await first.start();
+    first.publish();
+
+    await trigger.onAgentDispatched?.({
+      executionId: "execution-1",
+      daemonId: "daemon-1",
+      agentId: "agent-1",
+      workspaceId: "workspace-1",
+      action: "created",
+      workspace: { action: "created" },
+      triggerContext: {},
+      outputContext: {},
+      send: async () => {},
+      cancel: async () => {},
+    });
+    const second = await runtime.prepare(
+      "slack",
+      slackConfiguration("A2"),
+      "https://hub.test",
+      { provider: "slack", id: "A2", name: "A2" },
+      2,
+    );
+    await second.start();
+    second.publish();
+    await trigger.onAgentStreamEvent?.({
+      executionId: "execution-1",
+      agentId: "agent-1",
+      daemonId: "daemon-1",
+      triggerContext: {},
+      outputContext: {},
+      event: { type: "turn_started", provider: "codex" },
+      observedAt: new Date(),
+    });
+
+    assert.deepEqual(notified, ["dispatched:A1:execution-1", "stream:A2:turn_started"]);
+  });
+
   it("routes replies and attachments through the active registration", async () => {
     const used: string[] = [];
     const stopped: string[] = [];
@@ -198,6 +271,7 @@ describe("dynamic provider runtime", () => {
       database,
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ configuration }) =>
         downstreamRegistration(configurationId(configuration), used, stopped),
     });
@@ -212,6 +286,7 @@ describe("dynamic provider runtime", () => {
       connectionsForProject: () => {
         throw new Error("unused");
       },
+      executionControl: createDeferredExecutionControl(),
     })!;
     const first = await runtime.prepare(
       "slack",
@@ -268,6 +343,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ configuration }) =>
         downstreamRegistration(providerConfigurationId(configuration), used, []),
     });
@@ -284,6 +360,7 @@ describe("dynamic provider runtime", () => {
       connectionsForProject: () => {
         throw new Error("unused");
       },
+      executionControl: createDeferredExecutionControl(),
     })!;
     const githubCandidate = await runtime.prepare(
       "github",
@@ -336,6 +413,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
     });
     const github = runtime
       .registrations()
@@ -365,6 +443,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ configuration }) =>
         downstreamRegistration(
           providerConfigurationId(configuration),
@@ -393,6 +472,7 @@ describe("dynamic provider runtime", () => {
       connectionsForProject: () => {
         throw new Error("unused");
       },
+      executionControl: createDeferredExecutionControl(),
     })!;
     const matches = await trigger.match({ ...externalTrigger(), source: "github.push" });
     if (typeof matches === "string") throw new Error("expected a match");
@@ -456,6 +536,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ configuration }) =>
         fakeRegistration(
           configurationId(configuration),
@@ -501,6 +582,7 @@ describe("dynamic provider runtime", () => {
         database: createMemoryDatabase(),
         auth: testAuth(),
         applicationBaseUrl: "https://hub.test",
+        executionControl: createDeferredExecutionControl(),
         registrationFactory: ({ provider: candidateProvider, configuration }) =>
           connectionRegistration(candidateProvider, providerConfigurationId(configuration)),
       });
@@ -530,6 +612,7 @@ describe("dynamic provider runtime", () => {
         database: createMemoryDatabase(),
         auth: testAuth(),
         applicationBaseUrl: "https://hub.test",
+        executionControl: createDeferredExecutionControl(),
         registrationFactory: ({ provider: candidateProvider, configuration }) =>
           connectionRegistration(
             candidateProvider,
@@ -583,6 +666,7 @@ describe("dynamic provider runtime", () => {
       database,
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ provider, configuration, callbackOrigin, configurationVersion }) => ({
         ...connectionRegistration(provider, providerConfigurationId(configuration)),
         configurationSnapshot: { version: configurationVersion, callbackOrigin },
@@ -614,6 +698,7 @@ describe("dynamic provider runtime", () => {
       database: createMemoryDatabase(),
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
+      executionControl: createDeferredExecutionControl(),
       registrationFactory: ({ provider, configuration }) => ({
         ...connectionRegistration(provider, providerConfigurationId(configuration)),
         sources: [
@@ -784,6 +869,33 @@ function fakeRegistration(
         },
       },
     ],
+    outputs: [],
+    requests: [],
+  };
+}
+
+function observingRegistration(id: string, notified: string[]): ProviderRegistration {
+  const trigger: TriggerProvider = {
+    name: "slack",
+    eventNames: ["slack.mention"],
+    match: () => Promise.resolve([]),
+    onAgentDispatched: (input) => {
+      notified.push(`dispatched:${id}:${input.executionId}`);
+      return Promise.resolve();
+    },
+    onAgentStreamEvent: (input) => {
+      notified.push(`stream:${id}:${input.event.type}`);
+      return Promise.resolve();
+    },
+  };
+  return {
+    connection: {
+      name: "slack",
+      status: () => ({ status: "connected" }),
+      actions: {},
+    },
+    triggerProviders: [() => trigger],
+    sources: [{ start: () => Promise.resolve(), stop: () => Promise.resolve() }],
     outputs: [],
     requests: [],
   };

@@ -4698,11 +4698,15 @@ interface AgentSessionDataRow extends QueryRow {
   data: import("../agent-sessions/index.js").AgentSessionRecord;
 }
 
-/** Rows written before `workspace_key` existed carry no `workspaceKey` in their jsonb. */
+/** Rows written before the workspace fields existed carry neither in their jsonb. */
 function toAgentSessionRecord(
   row: AgentSessionDataRow,
 ): import("../agent-sessions/index.js").AgentSessionRecord {
-  return { ...row.data, workspaceKey: row.data.workspaceKey ?? null };
+  return {
+    ...row.data,
+    workspaceKey: row.data.workspaceKey ?? null,
+    workspaceResolution: row.data.workspaceResolution ?? null,
+  };
 }
 
 export interface LinearAgentSessionRow extends QueryRow {
