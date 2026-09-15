@@ -9,6 +9,7 @@ export class ScheduleTestDaemon implements DaemonConnection {
     id: "schedule-agent",
     workspaceId: "schedule-workspace",
     status: "running",
+    pendingPermissions: [],
   };
   readonly agents: AgentConnection = {
     create: async (_key, options) => {
@@ -21,6 +22,9 @@ export class ScheduleTestDaemon implements DaemonConnection {
     },
     restore: async () => true,
     control: async () => {},
+    inspectWorkspace: async () => ({ kind: "active" }),
+    readWorkspace: async () => undefined,
+    respondToPermission: async () => "resolved",
     watch: async () => () => {},
   };
   async getProviderSnapshot(): Promise<import("../../hub/protocol.js").HubProviderSnapshot> {

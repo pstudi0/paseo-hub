@@ -1,4 +1,6 @@
 import type {
+  AgentDispatchNotification,
+  AgentStreamNotification,
   TriggerProvider,
   TriggerProviderLifecycleResult,
   TriggerProviderReactionState,
@@ -70,6 +72,22 @@ export async function notifyAgentExecutionTerminal(input: {
   triggerContext: unknown;
 }): Promise<void> {
   await input.provider.onAgentExecutionTerminal?.(input.executionId, input.triggerContext);
+}
+
+/** No reaction state: the daemon agent identity lives on the execution, not on the reaction. */
+export async function notifyAgentDispatched(input: {
+  provider: TriggerProvider;
+  notification: AgentDispatchNotification;
+}): Promise<void> {
+  await input.provider.onAgentDispatched?.(input.notification);
+}
+
+/** No reaction state: stream events are too frequent to round-trip through the execution row. */
+export async function notifyAgentStreamEvent(input: {
+  provider: TriggerProvider;
+  notification: AgentStreamNotification;
+}): Promise<void> {
+  await input.provider.onAgentStreamEvent?.(input.notification);
 }
 
 export async function notifyMachineTerminated(input: {

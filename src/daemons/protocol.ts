@@ -17,6 +17,13 @@ export interface DaemonCreateAgentOptions {
   env: Record<string, string>;
   mcpServers?: Record<string, McpHttpServerConfig>;
   worktree?: WorktreeTarget;
+  /** Create the agent inside an existing daemon workspace; the daemon then ignores `cwd`. */
+  workspaceId?: string;
+  /**
+   * Opaque agent labels. Hub uses the `hub.` prefix (`hub.workspace-key`, `hub.continuation-key`);
+   * the daemon reserves `paseo.`.
+   */
+  labels?: Record<string, string>;
 }
 
 export interface McpToolRef {

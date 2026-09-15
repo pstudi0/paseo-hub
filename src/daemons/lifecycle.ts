@@ -1,6 +1,11 @@
 import { DaemonAgentError } from "./agents/index.js";
 import { AgentSessions, AgentSessionError } from "../agent-sessions/index.js";
-import type { AgentEvent } from "./agents/index.js";
+import type { AgentEvent, AgentPermissionResponse } from "./agents/index.js";
+import type {
+  ExecutionControl,
+  PermissionAnswerOutcome,
+  SteerOutcome,
+} from "./execution-control.js";
 import {
   buildExecutionCapabilityMcpServer,
   deriveAgentExecutionCompletionToken,
@@ -32,14 +37,16 @@ import type { ExecutionAuthority } from "../execution-authority/index.js";
 import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
 import { executionToolPolicy } from "../execution-capabilities/tool-policy.js";
 import {
+  notifyAgentDispatched,
   notifyAgentExecutionCompleted,
   notifyAgentExecutionFailed,
   notifyAgentExecutionStarted,
   notifyAgentExecutionTerminal,
+  notifyAgentStreamEvent,
   notifyDispatchAccepted,
   notifyMachineTerminated,
 } from "../triggers/lifecycle.js";
-import type { TriggerProviderReactionState } from "../triggers/index.js";
+import type { AgentDispatchNotification, TriggerProviderReactionState } from "../triggers/index.js";
 import {
   DaemonResponseLostError,
   type DaemonAgentStreamEvent,
@@ -70,6 +77,15 @@ interface HubExecutionEnv {
   executionId: string;
   completionToken: string;
   publicBaseUrl: string;
+}
+
+/** Who receives an execution's stream events; the agent filter needs no database read per event. */
+interface StreamObserver {
+  provider: TriggerProvider;
+  triggerContext: unknown;
+  outputContext: unknown;
+  daemonId: string;
+  agentId: string;
 }
 
 const DEFAULT_DISPATCH_TIMEOUT_MS = 30_000;
@@ -148,7 +164,7 @@ export class AgentExecutionOutputValidationFailure extends Error {
   }
 }
 
-export class DaemonDispatchLifecycle {
+export class DaemonDispatchLifecycle implements ExecutionControl {
   private readonly providersByName: Map<string, TriggerProvider>;
   private readonly executionCapabilities: OutputExecutorRegistry;
   private readonly startedExecutions = new Set<string>();
@@ -158,6 +174,8 @@ export class DaemonDispatchLifecycle {
   private readonly reconcilingHubActions = new Map<string, Promise<void>>();
   private readonly daemonRecoveries = new Set<Promise<void>>();
   private readonly executionSubscriptions = new Map<string, () => void>();
+  private readonly streamObservers = new Map<string, StreamObserver>();
+  private readonly providerNotifications = new Set<Promise<void>>();
   private stopping = false;
 
   constructor(private readonly options: DaemonDispatchLifecycleOptions) {
@@ -175,6 +193,7 @@ export class DaemonDispatchLifecycle {
     this.stopping = true;
     for (const unsubscribe of this.executionSubscriptions.values()) unsubscribe();
     this.executionSubscriptions.clear();
+    this.streamObservers.clear();
     for (const clear of this.deadlineTimersByExecution.values()) clear();
     this.deadlineTimersByExecution.clear();
     this.startedExecutions.clear();
@@ -183,7 +202,103 @@ export class DaemonDispatchLifecycle {
       ...this.reconcilingHubActions.values(),
       ...this.pendingStreamHandlersByExecution.values(),
       ...this.activeExecutionDispatches.values(),
+      ...this.providerNotifications,
     ]);
+  }
+
+  /**
+   * Steers the live agent with the text verbatim. A pending permission is reported instead of
+   * steered: the daemon clears pending permissions on a steer, which would deny it implicitly.
+   */
+  async steer(executionId: string, messageId: string, text: string): Promise<SteerOutcome> {
+    const execution = await this.options.database.findAgentExecutionById(executionId);
+    if (execution === undefined || isTerminalExecutionStatus(execution.status)) return "not_live";
+    if (execution.daemonAgentId === null || execution.daemonId === null) return "agent_pending";
+    const connection = this.options.connectionForDaemon(execution.daemonId);
+    if (connection === undefined) throw new DaemonDispatchFailure("daemon_unreachable");
+    const agent = await connection.agents.get(execution.daemonAgentId);
+    const pending = agent.pendingPermissions[0];
+    if (pending !== undefined) return { status: "permission_pending", requestId: pending.id };
+    await connection.agents.send(execution.daemonAgentId, messageId, text);
+    await this.refreshAgentIdleDeadline(executionId, new Date(this.now()));
+    return "sent";
+  }
+
+  /**
+   * Cancels the agent when one exists and fails the execution with no Hub action: neither an
+   * archive (even with `autoArchive`) nor a second interrupt follows. An execution still spawning
+   * has no agent to cancel; the provider cancels the agent it learns of in `onAgentDispatched`.
+   */
+  async interrupt(executionId: string, reason: string): Promise<boolean> {
+    const execution = await this.options.database.findAgentExecutionById(executionId);
+    if (execution === undefined || isTerminalExecutionStatus(execution.status)) return false;
+    if (execution.daemonAgentId !== null && execution.daemonId !== null) {
+      const agentId = execution.daemonAgentId;
+      const connection = this.options.connectionForDaemon(execution.daemonId);
+      if (connection !== undefined) {
+        await this.cancelAgent(connection, execution, agentId).catch((error: unknown) => {
+          this.report(error, "daemon.execution.interrupt", { executionId });
+        });
+      }
+    }
+    await this.failAgentExecution(executionId, reason, { suppressHubAction: true });
+    return true;
+  }
+
+  private async cancelAgent(
+    connection: DaemonConnection,
+    execution: AgentExecutionRecord,
+    agentId: string,
+  ): Promise<void> {
+    const session =
+      execution.agentSessionId === null
+        ? undefined
+        : await this.options.database.findAgentSession(execution.agentSessionId);
+    const workspaceId = session?.workspaceId ?? (await connection.agents.get(agentId)).workspaceId;
+    await connection.agents.control(agentId, workspaceId, "interrupt");
+  }
+
+  /** `agent_permission_response` needs the daemon permission `workspace.write`, which `hub.execute` does not cover. */
+  async respondToPermission(
+    executionId: string,
+    requestId: string,
+    response: AgentPermissionResponse,
+  ): Promise<PermissionAnswerOutcome> {
+    const execution = await this.options.database.findAgentExecutionById(executionId);
+    if (execution === undefined || execution.daemonId === null) return "not_live";
+    const permissions = await this.daemonPermissions(execution.daemonId);
+    if (!permissions.includes("workspace.write")) return "permission_missing";
+    if (isTerminalExecutionStatus(execution.status) || execution.daemonAgentId === null)
+      return "not_live";
+    const connection = this.options.connectionForDaemon(execution.daemonId);
+    if (connection === undefined) return "unconfirmed";
+    try {
+      return await connection.agents.respondToPermission(
+        execution.daemonAgentId,
+        requestId,
+        response,
+      );
+    } catch (error) {
+      if (error instanceof DaemonAgentError) return { status: "rejected", error: error.message };
+      throw error;
+    }
+  }
+
+  async readWorkspacePullRequest(
+    executionId: string,
+  ): Promise<{ url: string; title?: string } | undefined> {
+    const execution = await this.options.database.findAgentExecutionById(executionId);
+    if (execution?.agentSessionId == null || execution.daemonId === null) return undefined;
+    const session = await this.options.database.findAgentSession(execution.agentSessionId);
+    const connection = this.options.connectionForDaemon(execution.daemonId);
+    if (session?.workspaceId == null || connection === undefined) return undefined;
+    const workspace = await connection.agents.readWorkspace(session.workspaceId);
+    const pullRequest = workspace?.githubRuntime?.pullRequest;
+    return pullRequest == null ? undefined : { url: pullRequest.url, title: pullRequest.title };
+  }
+
+  async daemonPermissions(daemonId: string): Promise<readonly string[]> {
+    return (await this.options.database.findDaemonById(daemonId))?.permissions ?? [];
   }
 
   async dispatchLaunchMachineIntent(intent: LaunchMachineIntent): Promise<DaemonDispatchResult> {
@@ -662,6 +777,7 @@ export class DaemonDispatchLifecycle {
         }
       }
       await this.handleAgentStreamEvent(executionId, event.event, observedAt);
+      this.forwardStreamEvent(executionId, event, observedAt);
       if (event.event.type === "turn_completed") {
         await this.options.database.recordAgentExecutionHubAcknowledgement(executionId, {
           kind: "terminal",
@@ -685,6 +801,67 @@ export class DaemonDispatchLifecycle {
       });
       await this.acknowledgeAgentExecutionHubAction(executionId, event.agentId, observedAt);
     }
+  }
+
+  /** Never awaited: the daemon event chain and callback completion must not wait on a provider. */
+  private forwardStreamEvent(
+    executionId: string,
+    event: Extract<DaemonEvent, { type: "agent_stream" }>,
+    observedAt: Date,
+  ): void {
+    const observer = this.streamObservers.get(executionId);
+    if (observer === undefined || observer.agentId !== event.agentId) return;
+    this.trackProviderNotification(
+      notifyAgentStreamEvent({
+        provider: observer.provider,
+        notification: {
+          executionId,
+          agentId: event.agentId,
+          daemonId: observer.daemonId,
+          triggerContext: observer.triggerContext,
+          outputContext: observer.outputContext,
+          event: event.event,
+          observedAt,
+        },
+      }),
+      "daemon.provider.stream",
+      executionId,
+    );
+  }
+
+  private trackProviderNotification(
+    notification: Promise<void>,
+    operation: string,
+    executionId: string,
+  ): void {
+    const tracked = notification
+      .catch((error: unknown) => {
+        this.report(error, operation, { executionId });
+      })
+      .finally(() => {
+        this.providerNotifications.delete(tracked);
+      });
+    this.providerNotifications.add(tracked);
+  }
+
+  private observeExecutionStream(
+    executionId: string,
+    provider: TriggerProvider | undefined,
+    context: { triggerContext: unknown; outputContext: unknown },
+    daemonId: string,
+    agentId: string,
+  ): void {
+    if (provider === undefined) {
+      this.streamObservers.delete(executionId);
+      return;
+    }
+    this.streamObservers.set(executionId, {
+      provider,
+      triggerContext: context.triggerContext,
+      outputContext: context.outputContext,
+      daemonId,
+      agentId,
+    });
   }
 
   private async acknowledgeAgentExecutionHubAction(
@@ -1057,6 +1234,13 @@ export class DaemonDispatchLifecycle {
     );
     this.executionSubscriptions.get(executionId)?.();
     this.executionSubscriptions.set(executionId, unsubscribe);
+    this.observeExecutionStream(
+      executionId,
+      this.findProviderForTriggerContext(execution.triggerContext),
+      execution,
+      daemonId,
+      execution.daemonAgentId,
+    );
   }
 
   async failPendingExecutionsForDisconnectedMachine(
@@ -1163,6 +1347,8 @@ export class DaemonDispatchLifecycle {
     details: {
       lastInvalidOutput?: unknown;
       notifyProvider?: boolean;
+      /** Record `hubAction: null`: the caller already stopped the agent and keeps the workspace. */
+      suppressHubAction?: boolean;
       deadlineCondition?: {
         kind: "hard" | "idle";
         deadlineAt: Date;
@@ -1204,6 +1390,7 @@ export class DaemonDispatchLifecycle {
         failureReason: reason,
         ...(details.deadlineKind === undefined ? {} : { deadlineKind: details.deadlineKind }),
       },
+      details.suppressHubAction === true,
     );
     if (!transition.transitioned) {
       if (isTerminalExecutionStatus(transition.execution.status)) {
@@ -1233,9 +1420,11 @@ export class DaemonDispatchLifecycle {
     status: "succeeded" | "failed",
     fields: TransitionAgentExecutionFields,
     workflow: Pick<WorkflowAgentCompletionInput, "stepStatus" | "stepOutput" | "failureReason">,
+    suppressHubAction = false,
   ): Promise<TransitionAgentExecutionResult> {
     const execution = await this.options.database.findAgentExecutionById(executionId);
     if (execution === undefined) throw new Error(`agent execution not found: ${executionId}`);
+    const hubAction = suppressHubAction ? null : deriveHubAction(execution, status);
     if (execution.workflowStepRunId !== null) {
       return this.options.database.completeWorkflowAgentExecution({
         executionId,
@@ -1251,12 +1440,12 @@ export class DaemonDispatchLifecycle {
           ? {}
           : { deadlineCondition: fields.deadlineCondition }),
         observedAt: new Date(this.now()),
-        hubAction: deriveHubAction(execution, status),
+        hubAction,
       });
     }
     return this.options.database.transitionAgentExecution(executionId, status, {
       ...fields,
-      hubAction: deriveHubAction(execution, status),
+      hubAction,
     });
   }
 
@@ -1530,6 +1719,7 @@ export class DaemonDispatchLifecycle {
   }): Promise<string> {
     const connection = this.options.connectionForDaemon(input.daemonId);
     if (!connection) throw new DaemonDispatchFailure("daemon_unreachable");
+    const provider = this.findProviderForTriggerContext(input.intent.triggerContext);
     const dispatched = await this.sessionOwner()
       .dispatch({
         executionId: input.executionId,
@@ -1542,8 +1732,19 @@ export class DaemonDispatchLifecycle {
             },
           ),
         onEvent: (event) => this.observeSessionEvent(input.executionId, input.daemonId, event),
+        // The daemon streams `turn_started` before it acknowledges the prompt: observe first.
+        onAgentReady: (agent) =>
+          this.observeExecutionStream(
+            input.executionId,
+            provider,
+            input.intent,
+            input.daemonId,
+            agent.agentId,
+          ),
       })
       .catch(async (error: unknown) => {
+        // The observer may already be registered when delivery fails after the agent is bound.
+        this.streamObservers.delete(input.executionId);
         const execution = await this.options.database.findAgentExecutionById(input.executionId);
         if (execution && isTerminalExecutionStatus(execution.status)) {
           await this.reconcileHubActionSafely(execution);
@@ -1554,6 +1755,26 @@ export class DaemonDispatchLifecycle {
     this.executionSubscriptions.set(input.executionId, dispatched.unsubscribe);
     await this.startAgentExecution(input.executionId);
     await this.armLiveExecutionDeadline(input.executionId);
+    if (provider !== undefined) {
+      const { agentId, workspaceId } = dispatched;
+      const notification: AgentDispatchNotification = {
+        executionId: input.executionId,
+        daemonId: input.daemonId,
+        agentId,
+        workspaceId,
+        action: dispatched.action,
+        workspace: dispatched.workspace,
+        triggerContext: input.intent.triggerContext,
+        outputContext: input.intent.outputContext,
+        send: (messageId, text) => connection.agents.send(agentId, messageId, text),
+        cancel: () => connection.agents.control(agentId, workspaceId, "interrupt"),
+      };
+      this.trackProviderNotification(
+        notifyAgentDispatched({ provider, notification }),
+        "daemon.provider.dispatched",
+        input.executionId,
+      );
+    }
     return dispatched.agentId;
   }
 
@@ -1662,6 +1883,7 @@ export class DaemonDispatchLifecycle {
   private releaseExecutionResources(executionId: string): void {
     this.executionSubscriptions.get(executionId)?.();
     this.executionSubscriptions.delete(executionId);
+    this.streamObservers.delete(executionId);
   }
 
   private async expireExecutionAtCurrentDeadline(
@@ -1915,6 +2137,7 @@ const DISPATCH_PREPARATION_FAILURE_CODES = new Set([
   "github_authority_unavailable",
   "github_integration_unavailable",
   "github_trigger_unavailable",
+  "linear_trigger_unavailable",
   "slack_trigger_unavailable",
 ]);
 

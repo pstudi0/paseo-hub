@@ -155,6 +155,7 @@ describe("daemon socket generations", () => {
       id: "agent-new",
       workspaceId: "workspace-agent-new",
       status: "idle",
+      pendingPermissions: [],
     });
   });
 

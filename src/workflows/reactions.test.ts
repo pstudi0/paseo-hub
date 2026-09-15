@@ -331,12 +331,15 @@ async function runTwoStepWorkflow<
     agents: {
       create: async (key) => {
         if (options.outcome === "prelaunch_failure") throw new Error("daemon rejected agent");
-        return { id: key, workspaceId: "workspace", status: "idle" };
+        return { id: key, workspaceId: "workspace", status: "idle", pendingPermissions: [] };
       },
-      get: async (id) => ({ id, workspaceId: "workspace", status: "idle" }),
+      get: async (id) => ({ id, workspaceId: "workspace", status: "idle", pendingPermissions: [] }),
       send: async () => {},
       control: async () => {},
       restore: async () => false,
+      inspectWorkspace: async () => ({ kind: "active" }),
+      readWorkspace: async () => undefined,
+      respondToPermission: async () => "resolved",
       watch: async () => () => {},
     },
     getProviderSnapshot: async () => {

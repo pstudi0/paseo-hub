@@ -418,6 +418,7 @@ function agentSession(id: string, overrides: Partial<AgentSessionRecord> = {}): 
     projectId: PROJECT_ID,
     continuationKey: `linear:session:${id}`,
     workspaceKey: "linear:issue:issue-1",
+    workspaceResolution: null,
     daemonId: "daemon-1",
     agentId: null,
     workspaceId: null,

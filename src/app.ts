@@ -50,6 +50,10 @@ import { createPublicOperations } from "./public-operations/index.js";
 import { createDatabasePublicOperationRepository } from "./public-operations/database-adapter.js";
 import type { EntitlementsService } from "./entitlements/service.js";
 import type { ExecutionAuthority } from "./execution-authority/index.js";
+import {
+  createDeferredExecutionControl,
+  type DeferredExecutionControl,
+} from "./daemons/execution-control.js";
 
 export interface HubRuntimeOptions {
   database: Database | null;
@@ -70,6 +74,11 @@ export interface HubRuntimeOptions {
   dispatchTimeoutMs?: number;
   browserOrganizationAccess?: BrowserOrganizationAccess;
   daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
+  /**
+   * The control handed to provider registrations built before this application (the dynamic
+   * provider runtime); bound here to the daemon lifecycle. Created locally when absent.
+   */
+  executionControl?: DeferredExecutionControl;
 }
 
 export interface HubRuntime {
@@ -128,20 +137,17 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
   const manualProvider =
     options.database === null ? undefined : createManualRunProvider(storeForProject);
   const attachments = createAttachmentRegistry(options);
-  const configuredProviders =
-    options.database === null
-      ? []
-      : (options.providerFactories ?? []).map((factory) =>
-          factory({
-            configurationStoreForProject: storeForProject,
-            connectionsForProject:
-              options.connectionsForProject ??
-              (() => () => {
-                throw new Error("no connection resolver registered");
-              }),
-            ...(attachments === undefined ? {} : { attachments }),
-          }),
-        );
+  const executionControl = deferredExecutionControl(options);
+  const configuredProviders = createConfiguredProviders(options, {
+    configurationStoreForProject: storeForProject,
+    connectionsForProject:
+      options.connectionsForProject ??
+      (() => () => {
+        throw new Error("no connection resolver registered");
+      }),
+    ...(attachments === undefined ? {} : { attachments }),
+    executionControl,
+  });
   const providers = [
     createScheduleProvider(),
     manualProvider,
@@ -149,7 +155,13 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     ...(options.providers ?? []),
   ].filter((provider): provider is TriggerProvider => provider !== undefined);
   const outputRegistry = options.outputRegistry ?? new OutputExecutorRegistry();
-  const daemonModule = createAppDaemonModule(options, daemons, providers, outputRegistry);
+  const daemonModule = createAppDaemonModule(
+    options,
+    daemons,
+    providers,
+    outputRegistry,
+    executionControl,
+  );
   const capabilityServer = createAppExecutionCapabilityServer(
     options,
     daemonModule,
@@ -316,6 +328,19 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
   return { hub, operations, publicApi, configurationForProject: storeForProject };
 }
 
+/** Providers are built before the daemon lifecycle they steer; the control is bound to it later. */
+function deferredExecutionControl(options: HubRuntimeOptions): DeferredExecutionControl {
+  return options.executionControl ?? createDeferredExecutionControl();
+}
+
+function createConfiguredProviders(
+  options: HubRuntimeOptions,
+  resources: TriggerProviderResources,
+): (TriggerProvider | undefined)[] {
+  if (options.database === null) return [];
+  return (options.providerFactories ?? []).map((factory) => factory(resources));
+}
+
 function createAppPublicOperations(
   options: HubRuntimeOptions,
   manualSource: ReturnType<typeof createManualTriggerSource> | undefined,
@@ -443,6 +468,7 @@ function createAppDaemonModule(
   daemons: ActiveDaemonRegistry | null,
   providers: readonly TriggerProvider[],
   outputRegistry: OutputExecutorRegistry,
+  executionControl: DeferredExecutionControl,
 ): DaemonModule | null {
   if (options.database === null) {
     return null;
@@ -450,7 +476,7 @@ function createAppDaemonModule(
 
   const usesTestTiming =
     options.executionDeadlineClock !== undefined || options.dispatchTimeoutMs !== undefined;
-  return createDaemonModule({
+  const module = createDaemonModule({
     database: options.database,
     connectionForDaemon: options.daemonConnectionForId ?? ((id) => daemons?.connection(id)),
     executionCapabilities: outputRegistry,
@@ -475,6 +501,8 @@ function createAppDaemonModule(
         }
       : {}),
   });
+  executionControl.bind(module.lifecycle);
+  return module;
 }
 
 function appScheduleSource(database: Database | null): TriggerSource | undefined {

@@ -10,11 +10,14 @@ import type {
   AttachmentResolver,
 } from "../attachments/capabilities.js";
 import type { SlackDeliveryStatus } from "../triggers/slack/source/index.js";
+import type { ExecutionControl } from "../daemons/execution-control.js";
 
 export interface TriggerProviderResources {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   connectionsForProject: (projectId: string) => ConnectionResolver;
   attachments?: AttachmentCapabilityRegistry;
+  /** Live control over dispatched executions; bound to the daemon lifecycle after construction. */
+  executionControl: ExecutionControl;
 }
 
 export type TriggerProviderFactory = (

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createDeferredExecutionControl } from "../../daemons/execution-control.js";
 import { createHmac } from "node:crypto";
 import { describe, it } from "vitest";
 import type { AuthServer } from "../../auth/server.js";
@@ -104,6 +105,7 @@ describe("GitHub registration", () => {
     registration.triggerProviders[0]?.({
       configurationStoreForProject: () => store,
       connectionsForProject: () => async () => "unused",
+      executionControl: createDeferredExecutionControl(),
     });
 
     await configuration.push(registration, "valid-sha", "push-valid");

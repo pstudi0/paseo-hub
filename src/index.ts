@@ -43,6 +43,7 @@ import {
   resolveCallbackOrigin,
 } from "./provider-applications/index.js";
 import { createSlackSocketInstallationVerifier } from "./providers/slack/installation.js";
+import { createDeferredExecutionControl } from "./daemons/execution-control.js";
 import { resolveHubDataDirectory } from "./data-directory.js";
 import { createInvitationMailer } from "./invitations/index.js";
 import { composeEmailDelivery } from "./email/index.js";
@@ -125,10 +126,12 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const providerStore = createProviderApplicationStore(runtime, locks, database);
     const providerVerifier = createProviderApplicationVerifier();
     const providerInventory = createProviderApplicationInventory(runtime);
+    const executionControl = createDeferredExecutionControl();
     const providerRuntime = new DynamicProviderRuntime({
       database,
       auth,
       applicationBaseUrl: identity.appUrl,
+      executionControl,
     });
     const providerApplications = createProviderApplications({
       auth,
@@ -161,6 +164,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       providerApplications,
       publicBaseUrl: identity.appUrl,
       completionTokenSecret: identity.authSecret,
+      executionControl,
       close: () => resources.close(),
     });
     const activationFailures = await activateProviderApplicationsAtStartup({
