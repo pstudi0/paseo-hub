@@ -5,6 +5,7 @@
     "fly.toml",
     "base/fly.toml",
     "src/db/migrations/meta/*.json",
-    "src/routeTree.gen.ts"
+    "src/routeTree.gen.ts",
+    "src/providers/linear/fixtures/*.graphql"
   ]
 }

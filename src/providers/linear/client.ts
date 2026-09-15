@@ -21,6 +21,81 @@ export const LINEAR_ISSUE_CONTEXT_LIMIT = 50;
 export const LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT = LINEAR_ISSUE_CONTEXT_LIMIT - 1;
 const LINEAR_ACCESS_TOKEN_REFRESH_SKEW_MS = 60_000;
 
+/**
+ * The `AgentActivityType` values that make up a session's conversation. The history window counts
+ * these only: the thoughts and actions a mirror emits are noise when a session is replayed.
+ */
+const LINEAR_CONVERSATION_ACTIVITY_TYPES = ["prompt", "response", "error", "elicitation"] as const;
+
+/**
+ * Every GraphQL document the client sends, keyed by operation. Documents are static and complete:
+ * values travel as typed variables and are never interpolated, so `client.test.ts` validates each
+ * one against the introspected schema fixture instead of trusting a request-time string.
+ */
+export const LINEAR_GRAPHQL_DOCUMENTS = {
+  viewer: `query PaseoViewer { viewer { id organization { id name } } }`,
+  issue: `query PaseoIssue($id: String!) {
+    issue(id: $id) {
+      id identifier title description url branchName
+      team { id key name }
+      project { id }
+      state { id name type }
+      assignee { id }
+      delegate { id }
+      labels { nodes { id } }
+    }
+  }`,
+  // `CommentFilter.createdAt` is a DateComparator over DateTimeOrDuration, a scalar distinct from
+  // DateTime: the whole filter travels as one variable so the schema, not a hand-written variable
+  // type, decides what the slot accepts.
+  issueCommentHistory: `query PaseoIssueCommentHistory($issueId: String!, $filter: CommentFilter) {
+    issue(id: $issueId) {
+      comments(last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}, orderBy: createdAt, filter: $filter) {
+        nodes { id body createdAt user { id name } }
+        pageInfo { hasPreviousPage }
+      }
+    }
+  }`,
+  commentCreate: `mutation PaseoComment($issueId: String!, $body: String!) {
+    commentCreate(input: { issueId: $issueId, body: $body }) { success }
+  }`,
+  agentActivityCreate: `mutation PaseoAgentActivityCreate($input: AgentActivityCreateInput!) {
+    agentActivityCreate(input: $input) { success agentActivity { id } }
+  }`,
+  agentSessionUpdate: `mutation PaseoAgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
+    agentSessionUpdate(id: $id, input: $input) { success }
+  }`,
+  agentSessionActivities: `query PaseoAgentSessionActivities($id: String!, $filter: AgentActivityFilter) {
+    agentSession(id: $id) {
+      activities(last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}, orderBy: createdAt, filter: $filter) {
+        nodes {
+          id createdAt signal user { id name }
+          content {
+            __typename
+            ... on AgentActivityPromptContent { body }
+            ... on AgentActivityResponseContent { body }
+            ... on AgentActivityErrorContent { body }
+            ... on AgentActivityElicitationContent { body }
+          }
+        }
+        pageInfo { hasPreviousPage }
+      }
+    }
+  }`,
+  teamStates: `query PaseoTeamStates($id: String!) {
+    team(id: $id) { states { nodes { id name type position } } }
+  }`,
+  issueUpdate: `mutation PaseoIssueUpdate($id: String!, $input: IssueUpdateInput!) {
+    issueUpdate(id: $id, input: $input) { success }
+  }`,
+  attachmentLinkGitHubPR: `mutation PaseoAttachmentLinkGitHubPR($issueId: String!, $url: String!, $title: String) {
+    attachmentLinkGitHubPR(issueId: $issueId, url: $url, title: $title) { success }
+  }`,
+  attachmentLinkURL: `mutation PaseoAttachmentLinkURL($issueId: String!, $url: String!, $title: String) {
+    attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success }
+  }`,
+} as const satisfies Readonly<Record<string, string>>;
+
 const LinearTokenResponseSchema = z
   .object({
     access_token: z.string().min(1),
@@ -90,23 +165,27 @@ const IssueResponseSchema = z.object({
 
 const IssueCommentHistoryResponseSchema = z.object({
   data: z.object({
-    comments: z.object({
-      nodes: z.array(
-        z.object({
-          id: z.string().min(1),
-          body: z.string(),
-          createdAt: z.string().datetime(),
-          user: z
-            .object({
+    issue: z
+      .object({
+        comments: z.object({
+          nodes: z.array(
+            z.object({
               id: z.string().min(1),
-              name: z.string().min(1).nullable().optional(),
-            })
-            .nullable()
-            .optional(),
+              body: z.string(),
+              createdAt: z.string().datetime(),
+              user: z
+                .object({
+                  id: z.string().min(1),
+                  name: z.string().min(1).nullable().optional(),
+                })
+                .nullable()
+                .optional(),
+            }),
+          ),
+          pageInfo: z.object({ hasPreviousPage: z.boolean() }),
         }),
-      ),
-      pageInfo: z.object({ hasPreviousPage: z.boolean() }),
-    }),
+      })
+      .nullable(),
   }),
 });
 
@@ -192,24 +271,34 @@ const IssueUpdateResponseSchema = z.object({
   data: z.object({ issueUpdate: z.object({ success: z.boolean() }) }),
 });
 
-const AttachmentLinkResponseSchema = z.object({
+const AttachmentLinkGitHubPRResponseSchema = z.object({
   data: z.object({ attachmentLinkGitHubPR: z.object({ success: z.boolean() }) }),
+});
+
+const AttachmentLinkURLResponseSchema = z.object({
+  data: z.object({ attachmentLinkURL: z.object({ success: z.boolean() }) }),
 });
 
 /**
  * A Linear API failure, kept distinguishable from Hub-side errors so callers can react to the
- * HTTP status (401/403: reauthorize, 429: back off) or to the GraphQL error code Linear attaches
- * under `extensions.code`. A GraphQL-level error carries the HTTP status of its transport (200).
+ * HTTP status (401/403: reauthorize) or to the GraphQL error code Linear attaches under
+ * `extensions.code`. Linear reports an exhausted quota as a GraphQL error with the code
+ * `RATELIMITED` on an HTTP 400, not as an HTTP 429, so the body is read on failed responses too;
+ * a GraphQL-level error carries the HTTP status of its transport (200). `retryAfterMs` is the
+ * time until the later of the request and complexity rate-limit windows resets, when Linear
+ * reported either.
  */
 export class LinearApiError extends Error {
   readonly status: number;
   readonly code: string | undefined;
+  readonly retryAfterMs: number | undefined;
 
-  constructor(message: string, details: { status: number; code?: string }) {
+  constructor(message: string, details: { status: number; code?: string; retryAfterMs?: number }) {
     super(message);
     this.name = "LinearApiError";
     this.status = details.status;
     this.code = details.code;
+    this.retryAfterMs = details.retryAfterMs;
   }
 }
 
@@ -351,11 +440,15 @@ export interface LinearApiClient {
     removedExternalUrls?: readonly string[];
     summary?: string;
   }): Promise<void>;
-  /** The bounded, chronological activities strictly before `beforeCreatedAt`. */
+  /**
+   * The bounded, chronological conversation (prompts, responses, errors, elicitations) strictly
+   * before `beforeCreatedAt`, without the activity that triggered the read when one is named.
+   */
   readAgentSessionActivities(input: {
     linearOrganizationId: string;
     agentSessionId: string;
     beforeCreatedAt: string;
+    excludeActivityId: string | null;
   }): Promise<LinearAgentSessionActivityHistory>;
   /** A team's workflow states in display order; callers pick by `type` (for example `started`). */
   readTeamStates(input: {
@@ -368,7 +461,18 @@ export interface LinearApiClient {
     stateId?: string;
     delegateId?: string;
   }): Promise<void>;
+  /**
+   * Attaches a pull request through the workspace's GitHub integration; fails when the workspace
+   * has none, in which case `linkUrl` is the fallback.
+   */
   linkGitHubPullRequest(input: {
+    linearOrganizationId: string;
+    issueId: string;
+    url: string;
+    title?: string;
+  }): Promise<void>;
+  /** Attaches any URL; Linear enriches it when an integration recognizes the link. */
+  linkUrl(input: {
     linearOrganizationId: string;
     issueId: string;
     url: string;
@@ -440,7 +544,7 @@ export function createLinearConnectionClient(options: {
         },
         now,
       );
-      const viewer = await readViewer(request, token.accessToken);
+      const viewer = await readViewer(request, token.accessToken, now);
       return {
         linearOrganizationId: viewer.organization.id,
         linearOrganizationName: viewer.organization.name,
@@ -508,9 +612,15 @@ export function createLinearApiClient(options: {
   connectionClient: Pick<LinearConnectionClient, "refresh">;
   fetch?: typeof fetch;
   now?: () => Date;
+  /** Abandons a GraphQL request that has not answered within this time; unbounded when omitted. */
+  timeoutMs?: number;
 }): LinearApiClient {
   const request = options.fetch ?? fetch;
   const now = options.now ?? (() => new Date());
+  const transport = {
+    now,
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  };
   // Avoid duplicate local work, while the database transaction remains the cross-process source of
   // truth for refresh serialization and rebind safety.
   const refreshes = new Map<string, Promise<string>>();
@@ -556,20 +666,12 @@ export function createLinearApiClient(options: {
   return {
     async readIssue(input) {
       const result = IssueResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssue($id: String!) {
-            issue(id: $id) {
-              id identifier title description url branchName
-              team { id key name }
-              project { id }
-              state { id name type }
-              assignee { id }
-              delegate { id }
-              labels { nodes { id } }
-            }
-          }`,
-          variables: { id: input.issueId },
-        }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          { query: LINEAR_GRAPHQL_DOCUMENTS.issue, variables: { id: input.issueId } },
+          transport,
+        ),
       );
       const issue = result.data.issue;
       return issue === null
@@ -594,24 +696,22 @@ export function createLinearApiClient(options: {
     },
     async readIssueComments(input) {
       const result = IssueCommentHistoryResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssueCommentHistory($issueId: String!, $before: DateTimeOrDuration!) {
-            comments(
-              last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
-              orderBy: createdAt
-              filter: {
-                issue: { id: { eq: $issueId } }
-                createdAt: { lt: $before }
-              }
-            ) {
-              nodes { id body createdAt user { id name } }
-              pageInfo { hasPreviousPage }
-            }
-          }`,
-          variables: { issueId: input.issueId, before: input.beforeCreatedAt },
-        }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.issueCommentHistory,
+            variables: {
+              issueId: input.issueId,
+              filter: { createdAt: { lt: input.beforeCreatedAt } },
+            },
+          },
+          transport,
+        ),
       );
-      const comments = result.data.comments.nodes
+      const issue = result.data.issue;
+      if (issue === null) throw new Error("Linear issue unavailable");
+      const comments = issue.comments.nodes
         .map((comment) => ({
           id: comment.id,
           body: comment.body,
@@ -629,39 +729,45 @@ export function createLinearApiClient(options: {
         .sort(compareLinearCommentOrder);
       return {
         comments,
-        complete: !result.data.comments.pageInfo.hasPreviousPage,
+        complete: !issue.comments.pageInfo.hasPreviousPage,
       };
     },
     async createComment(input) {
       const result = CommentResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoComment($issueId: String!, $body: String!) {
-            commentCreate(input: { issueId: $issueId, body: $body }) { success }
-          }`,
-          variables: { issueId: input.issueId, body: input.body },
-        }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.commentCreate,
+            variables: { issueId: input.issueId, body: input.body },
+          },
+          transport,
+        ),
       );
       if (!result.data.commentCreate.success) throw new Error("Linear comment was not accepted");
     },
     async createAgentActivity(input) {
       const result = AgentActivityCreateResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoAgentActivityCreate($input: AgentActivityCreateInput!) {
-            agentActivityCreate(input: $input) { success agentActivity { id } }
-          }`,
-          variables: {
-            input: {
-              agentSessionId: input.agentSessionId,
-              ...(input.id === undefined ? {} : { id: input.id }),
-              content: input.content,
-              ...(input.ephemeral === undefined ? {} : { ephemeral: input.ephemeral }),
-              ...(input.signal === undefined ? {} : { signal: input.signal }),
-              ...(input.signalMetadata === undefined
-                ? {}
-                : { signalMetadata: input.signalMetadata }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.agentActivityCreate,
+            variables: {
+              input: {
+                agentSessionId: input.agentSessionId,
+                ...(input.id === undefined ? {} : { id: input.id }),
+                content: input.content,
+                ...(input.ephemeral === undefined ? {} : { ephemeral: input.ephemeral }),
+                ...(input.signal === undefined ? {} : { signal: input.signal }),
+                ...(input.signalMetadata === undefined
+                  ? {}
+                  : { signalMetadata: input.signalMetadata }),
+              },
             },
           },
-        }),
+          transport,
+        ),
       );
       if (!result.data.agentActivityCreate.success) {
         throw new Error("Linear agent activity was not accepted");
@@ -670,25 +776,28 @@ export function createLinearApiClient(options: {
     },
     async updateAgentSession(input) {
       const result = AgentSessionUpdateResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoAgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
-            agentSessionUpdate(id: $id, input: $input) { success }
-          }`,
-          variables: {
-            id: input.agentSessionId,
-            // Never `externalUrls` or `externalLink`: those replace every link on the session.
-            input: {
-              ...(input.plan === undefined ? {} : { plan: input.plan }),
-              ...(input.addedExternalUrls === undefined
-                ? {}
-                : { addedExternalUrls: input.addedExternalUrls }),
-              ...(input.removedExternalUrls === undefined
-                ? {}
-                : { removedExternalUrls: input.removedExternalUrls }),
-              ...(input.summary === undefined ? {} : { summary: input.summary }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.agentSessionUpdate,
+            variables: {
+              id: input.agentSessionId,
+              // Never `externalUrls` or `externalLink`: those replace every link on the session.
+              input: {
+                ...(input.plan === undefined ? {} : { plan: input.plan }),
+                ...(input.addedExternalUrls === undefined
+                  ? {}
+                  : { addedExternalUrls: input.addedExternalUrls }),
+                ...(input.removedExternalUrls === undefined
+                  ? {}
+                  : { removedExternalUrls: input.removedExternalUrls }),
+                ...(input.summary === undefined ? {} : { summary: input.summary }),
+              },
             },
           },
-        }),
+          transport,
+        ),
       );
       if (!result.data.agentSessionUpdate.success) {
         throw new Error("Linear agent session update was not accepted");
@@ -696,33 +805,25 @@ export function createLinearApiClient(options: {
     },
     async readAgentSessionActivities(input) {
       const result = AgentSessionActivitiesResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoAgentSessionActivities($id: String!, $before: DateTimeOrDuration!) {
-            agentSession(id: $id) {
-              activities(
-                last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
-                orderBy: createdAt
-                filter: { createdAt: { lt: $before } }
-              ) {
-                nodes {
-                  id createdAt signal user { id name }
-                  content {
-                    __typename
-                    ... on AgentActivityPromptContent { body }
-                    ... on AgentActivityResponseContent { body }
-                    ... on AgentActivityErrorContent { body }
-                    ... on AgentActivityElicitationContent { body }
-                  }
-                }
-                pageInfo { hasPreviousPage }
-              }
-            }
-          }`,
-          variables: { id: input.agentSessionId, before: input.beforeCreatedAt },
-        }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.agentSessionActivities,
+            variables: {
+              id: input.agentSessionId,
+              filter: {
+                createdAt: { lt: input.beforeCreatedAt },
+                type: { in: [...LINEAR_CONVERSATION_ACTIVITY_TYPES] },
+              },
+            },
+          },
+          transport,
+        ),
       );
       const session = result.data.agentSession;
       const activities = session.activities.nodes
+        .filter((node) => node.id !== input.excludeActivityId)
         .map(normalizeAgentSessionActivity)
         .filter((activity) => activity !== undefined)
         .sort(compareLinearCommentOrder);
@@ -730,12 +831,12 @@ export function createLinearApiClient(options: {
     },
     async readTeamStates(input) {
       const result = TeamStatesResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoTeamStates($id: String!) {
-            team(id: $id) { states { nodes { id name type position } } }
-          }`,
-          variables: { id: input.teamId },
-        }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          { query: LINEAR_GRAPHQL_DOCUMENTS.teamStates, variables: { id: input.teamId } },
+          transport,
+        ),
       );
       const team = result.data.team;
       if (team === null) throw new Error("Linear team unavailable");
@@ -743,38 +844,68 @@ export function createLinearApiClient(options: {
     },
     async updateIssue(input) {
       const result = IssueUpdateResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoIssueUpdate($id: String!, $input: IssueUpdateInput!) {
-            issueUpdate(id: $id, input: $input) { success }
-          }`,
-          variables: {
-            id: input.issueId,
-            input: {
-              ...(input.stateId === undefined ? {} : { stateId: input.stateId }),
-              ...(input.delegateId === undefined ? {} : { delegateId: input.delegateId }),
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.issueUpdate,
+            variables: {
+              id: input.issueId,
+              input: {
+                ...(input.stateId === undefined ? {} : { stateId: input.stateId }),
+                ...(input.delegateId === undefined ? {} : { delegateId: input.delegateId }),
+              },
             },
           },
-        }),
+          transport,
+        ),
       );
       if (!result.data.issueUpdate.success) throw new Error("Linear issue update was not accepted");
     },
     async linkGitHubPullRequest(input) {
-      const result = AttachmentLinkResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoAttachmentLinkGitHubPR($issueId: String!, $url: String!, $title: String) {
-            attachmentLinkGitHubPR(issueId: $issueId, url: $url, title: $title) { success }
-          }`,
-          variables: {
-            issueId: input.issueId,
-            url: input.url,
-            ...(input.title === undefined ? {} : { title: input.title }),
+      const result = AttachmentLinkGitHubPRResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.attachmentLinkGitHubPR,
+            variables: attachmentLinkVariables(input),
           },
-        }),
+          transport,
+        ),
       );
       if (!result.data.attachmentLinkGitHubPR.success) {
         throw new Error("Linear pull request link was not accepted");
       }
     },
+    async linkUrl(input) {
+      const result = AttachmentLinkURLResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.attachmentLinkURL,
+            variables: attachmentLinkVariables(input),
+          },
+          transport,
+        ),
+      );
+      if (!result.data.attachmentLinkURL.success) {
+        throw new Error("Linear link was not accepted");
+      }
+    },
+  };
+}
+
+function attachmentLinkVariables(input: {
+  issueId: string;
+  url: string;
+  title?: string;
+}): Record<string, unknown> {
+  return {
+    issueId: input.issueId,
+    url: input.url,
+    ...(input.title === undefined ? {} : { title: input.title }),
   };
 }
 
@@ -842,12 +973,14 @@ async function exchangeToken(
   };
 }
 
-async function readViewer(request: typeof fetch, accessToken: string) {
+async function readViewer(request: typeof fetch, accessToken: string, now: () => Date) {
   const result = ViewerResponseSchema.parse(
-    await graphql(request, accessToken, {
-      query: `query PaseoViewer { viewer { id organization { id name } } }`,
-      variables: {},
-    }),
+    await graphql(
+      request,
+      accessToken,
+      { query: LINEAR_GRAPHQL_DOCUMENTS.viewer, variables: {} },
+      { now },
+    ),
   );
   return result.data.viewer;
 }
@@ -856,6 +989,7 @@ async function graphql(
   request: typeof fetch,
   accessToken: string,
   payload: { query: string; variables: Record<string, unknown> },
+  transport: { now: () => Date; timeoutMs?: number },
 ): Promise<unknown> {
   const response = await request("https://api.linear.app/graphql", {
     method: "POST",
@@ -864,22 +998,72 @@ async function graphql(
       "content-type": "application/json",
     },
     body: JSON.stringify(payload),
+    ...(transport.timeoutMs === undefined
+      ? {}
+      : { signal: AbortSignal.timeout(transport.timeoutMs) }),
   });
+  const retryAfterMs = readRetryAfterMs(response.headers, transport.now());
+  const retry = retryAfterMs === undefined ? {} : { retryAfterMs };
   if (!response.ok) {
-    throw new LinearApiError(`Linear GraphQL HTTP ${response.status}`, {
-      status: response.status,
-    });
+    const failure = readGraphqlFailure(await readJson(response));
+    throw new LinearApiError(
+      failure === undefined
+        ? `Linear GraphQL HTTP ${response.status}`
+        : `Linear GraphQL HTTP ${response.status}: ${failure.message}`,
+      {
+        status: response.status,
+        ...(failure?.code === undefined ? {} : { code: failure.code }),
+        ...retry,
+      },
+    );
   }
   const result: unknown = await response.json();
-  const errors = GraphqlErrorSchema.safeParse(result);
-  if (errors.success && errors.data.errors !== undefined) {
-    const [first] = errors.data.errors;
-    throw new LinearApiError(`Linear GraphQL ${first!.message}`, {
+  const failure = readGraphqlFailure(result);
+  if (failure !== undefined) {
+    throw new LinearApiError(`Linear GraphQL ${failure.message}`, {
       status: response.status,
-      ...(first!.extensions?.code === undefined ? {} : { code: first!.extensions.code }),
+      ...(failure.code === undefined ? {} : { code: failure.code }),
+      ...retry,
     });
   }
   return result;
+}
+
+/** The first GraphQL error of a response body, when the body carries any. */
+function readGraphqlFailure(
+  body: unknown,
+): { message: string; code: string | undefined } | undefined {
+  const errors = GraphqlErrorSchema.safeParse(body);
+  if (!errors.success || errors.data.errors === undefined) return undefined;
+  const [first] = errors.data.errors;
+  return { message: first!.message, code: first!.extensions?.code };
+}
+
+/** A failed response's JSON body; `undefined` when the body is not JSON at all. */
+async function readJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Linear reports when its request and complexity rate-limit windows reset as UTC epoch
+ * milliseconds in `X-RateLimit-Requests-Reset` and `X-RateLimit-Complexity-Reset`; the later
+ * window bounds how long a caller should wait. (The unit is documented, not yet observed against a
+ * staging workspace.)
+ */
+function readRetryAfterMs(headers: Headers, now: Date): number | undefined {
+  const waits: number[] = [];
+  for (const name of ["x-ratelimit-requests-reset", "x-ratelimit-complexity-reset"]) {
+    const value = headers.get(name);
+    if (value === null) continue;
+    const resetAt = Number(value);
+    if (!Number.isFinite(resetAt)) continue;
+    waits.push(Math.max(0, resetAt - now.getTime()));
+  }
+  return waits.length === 0 ? undefined : Math.max(...waits);
 }
 
 function parseLinearScopes(scope: string | readonly string[] | undefined): string[] {

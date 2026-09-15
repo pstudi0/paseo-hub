@@ -439,6 +439,7 @@ function replayProviderReceipt(
   return {
     status: "accepted",
     receiptId: receipt.id,
+    replayed: true,
     events: routes.map((route) => ({
       providerEventReceiptId: receipt.id,
       organizationId: receipt.organizationId,

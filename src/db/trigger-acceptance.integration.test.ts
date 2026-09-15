@@ -248,12 +248,30 @@ describe("trigger acceptance persistence", () => {
       receivedAt: new Date(0),
     });
     assert.equal(accepted.status, "accepted");
-    if (accepted.status === "accepted") {
-      assert.deepEqual(
-        accepted.events.map((event) => [event.projectId, event.resourceId]),
-        [[projectId, "team-1"]],
-      );
-    }
+    if (accepted.status !== "accepted") throw new Error("expected an accepted event");
+    assert.deepEqual(
+      accepted.events.map((event) => [event.projectId, event.resourceId]),
+      [[projectId, "team-1"]],
+    );
+    assert.equal("replayed" in accepted, false);
+
+    // Linear re-signs a redelivered body: the same delivery key arrives under another signature
+    // hash and must come back as the events already handed out, marked as a replay.
+    const replayed = await database.acceptLinearEvent({
+      linearOrganizationId: "linear-team-workspace",
+      resourceId: "team-1",
+      deliveryId: "linear-agent-session:session-1",
+      signatureHash: "linear-agent-session:session-1:redelivered",
+      source: "linear.agent_session",
+      payload: {},
+      receivedAt: new Date(5_000),
+    });
+    assert.deepEqual(replayed, {
+      status: "accepted",
+      receiptId: accepted.receiptId,
+      replayed: true,
+      events: accepted.events,
+    });
     assert.equal(
       (
         await database.findProviderEventReceiptByDeliveryId(

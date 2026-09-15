@@ -1511,8 +1511,10 @@ function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
 
 /**
  * A session trigger without a team would serve every team the app can see, and a delegation
- * runs code on the operator's daemon: `created` needs named humans, `prompted` may accept anyone
- * because it only continues a session those humans already opened.
+ * runs code on the operator's daemon: `created` needs named humans or an explicit opt-in to
+ * creator-less automations (a triage rule delegating without any human allowed is a valid
+ * policy), and never "everyone"; `prompted` may accept anyone because it only continues a
+ * session those humans already opened.
  */
 function validateLinearSessionLaunchSecurity(trigger: CompiledTrigger): void {
   if (trigger.filters?.team === undefined) {
@@ -1520,9 +1522,14 @@ function validateLinearSessionLaunchSecurity(trigger: CompiledTrigger): void {
   }
   const fromUsers = trigger.filters.from_users ?? [];
   if (trigger.on === "linear.agent_session_created") {
-    if (fromUsers.length === 0 || fromUsers.includes("*")) {
+    if (fromUsers.includes("*")) {
       throw new Error(
         `trigger ${trigger.name} requires explicit Linear user IDs in filters.from_users for linear.agent_session_created; "*" is not allowed because a delegation runs code on your daemon`,
+      );
+    }
+    if (fromUsers.length === 0 && trigger.filters.allow_automations !== true) {
+      throw new Error(
+        `trigger ${trigger.name} requires explicit Linear user IDs in filters.from_users or filters.allow_automations: true for linear.agent_session_created; a delegation runs code on your daemon`,
       );
     }
     return;

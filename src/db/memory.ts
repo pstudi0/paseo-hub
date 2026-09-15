@@ -3435,6 +3435,7 @@ class MemoryDatabase implements Database {
       return {
         status: "accepted",
         receiptId,
+        replayed: true,
         events: receipt.acceptedRoutes.map((route) => ({
           providerEventReceiptId: receipt.id,
           organizationId: receipt.organizationId,

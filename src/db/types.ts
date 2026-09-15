@@ -707,7 +707,17 @@ export interface DurableProviderEvent {
 }
 
 export type ProviderEventAcceptance =
-  | { status: "accepted"; events: DurableProviderEvent[]; receiptId: string }
+  | {
+      status: "accepted";
+      events: DurableProviderEvent[];
+      receiptId: string;
+      /**
+       * Present only when the delivery replays a receipt that already carries accepted routes: the
+       * `events` are the ones handed out the first time, so a caller must not acknowledge or
+       * dispatch them again. A first acceptance never sets the key.
+       */
+      replayed?: true;
+    }
   | { status: "duplicate"; receiptId: string }
   | { status: "dropped"; receiptId: string; reason: string };
 

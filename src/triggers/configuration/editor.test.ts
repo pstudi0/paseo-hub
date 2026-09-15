@@ -524,6 +524,38 @@ test("a delegation trigger names its audience on the field, never everyone", () 
   });
 });
 
+test("a delegation admitting automations without named users stays in YAML, with names it round-trips", () => {
+  const automationsOnly = LINEAR_SESSION.replace(
+    "from_users: [user-anthony]",
+    "allow_automations: true",
+  );
+  expect(TriggerDocumentSchema.safeParse(parseDocument(automationsOnly).toJS()).success).toBe(true);
+  expect(projectTriggerForm(automationsOnly)).toEqual({
+    status: "yaml_only",
+    reason:
+      "A delegation trigger that admits automations without naming users can only be edited in YAML.",
+  });
+
+  const named = LINEAR_SESSION.replace(
+    "from_users: [user-anthony]",
+    "from_users: [user-anthony]\n      allow_automations: true",
+  );
+  const projection = projectTriggerForm(named);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  expect(projection.value.allowedUsers).toBe("user-anthony");
+  expect(triggerFormErrors(projection.value)).toEqual({});
+  const patched = patchTriggerYaml(named, { ...projection.value, prompt: "Changed." });
+  expect(
+    TriggerDocumentSchema.parse(parseDocument(patched).toJS()).on["linear.agent_session_created"]
+      ?.filters,
+  ).toEqual({
+    from_users: ["user-anthony"],
+    allow_automations: true,
+    team: LINEAR_TEAM_ID,
+    source: ["delegation"],
+  });
+});
+
 test("switching to a delegation event clears an everyone audience so the field asks for names", () => {
   const projection = projectTriggerForm(ADVANCED);
   if (projection.status !== "editable") throw new Error(projection.reason);

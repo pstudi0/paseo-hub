@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { buildSchema, parse, validate } from "graphql";
 import { describe, it } from "vitest";
 import type {
   Database,
@@ -11,6 +13,7 @@ import {
   createLinearApiClient,
   createLinearConnectionClient,
   hasRequiredLinearScopes,
+  LINEAR_GRAPHQL_DOCUMENTS,
   LINEAR_REQUIRED_SCOPES,
   LinearApiError,
   type LinearApiClient,
@@ -159,22 +162,24 @@ describe("Linear connection client", () => {
         });
         return json({
           data: {
-            comments: {
-              nodes: [
-                {
-                  id: "comment-2",
-                  body: "second",
-                  createdAt: "2023-11-14T22:13:19.002Z",
-                  user: { id: "user-2", name: "Paseo" },
-                },
-                {
-                  id: "comment-1",
-                  body: "first",
-                  createdAt: "2023-11-14T22:13:19.001Z",
-                  user: null,
-                },
-              ],
-              pageInfo: { hasPreviousPage: true },
+            issue: {
+              comments: {
+                nodes: [
+                  {
+                    id: "comment-2",
+                    body: "second",
+                    createdAt: "2023-11-14T22:13:19.002Z",
+                    user: { id: "user-2", name: "Paseo" },
+                  },
+                  {
+                    id: "comment-1",
+                    body: "first",
+                    createdAt: "2023-11-14T22:13:19.001Z",
+                    user: null,
+                  },
+                ],
+                pageInfo: { hasPreviousPage: true },
+              },
             },
           },
         });
@@ -206,18 +211,25 @@ describe("Linear connection client", () => {
     });
     assert.equal(requests[0]?.authorization, "Bearer access-token");
     const request = graphqlRequest(requests[0]?.body ?? "{}");
-    // `createdAt.lt` is a DateTimeOrDuration slot: Linear rejects a DateTime! variable there.
-    assert.match(
-      request.query,
-      /query PaseoIssueCommentHistory\(\$issueId: String!, \$before: DateTimeOrDuration!\)/u,
-    );
-    assert.match(request.query, /last: 49/u);
-    assert.match(request.query, /orderBy: createdAt/u);
-    assert.match(request.query, /createdAt: \{ lt: \$before \}/u);
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.issueCommentHistory);
+    // The filter is one typed variable, so `createdAt.lt` lands in its DateTimeOrDuration slot.
     assert.deepEqual(request.variables, {
       issueId: "issue-1",
-      before: "2023-11-14T22:13:19.003Z",
+      filter: { createdAt: { lt: "2023-11-14T22:13:19.003Z" } },
     });
+  });
+
+  it("reports a missing issue instead of an empty comment history", async () => {
+    const { api } = apiClient(() => json({ data: { issue: null } }));
+
+    await assert.rejects(
+      api.readIssueComments({
+        linearOrganizationId: "linear-org",
+        issueId: "issue-gone",
+        beforeCreatedAt: "2023-11-14T22:13:19.003Z",
+      }),
+      /Linear issue unavailable/u,
+    );
   });
 
   it("refreshes an expired token before calling the Linear GraphQL API", async () => {
@@ -599,14 +611,7 @@ describe("Linear API client contracts", () => {
       labelIds: ["label-1"],
     });
     const request = graphqlRequest(requests[0]!.body);
-    for (const field of [
-      "branchName",
-      "team { id key name }",
-      "state { id name type }",
-      "delegate { id }",
-    ]) {
-      assert.ok(request.query.includes(field), `query lacks ${field}`);
-    }
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.issue);
     assert.deepEqual(request.variables, { id: "issue-1" });
   });
 
@@ -631,14 +636,7 @@ describe("Linear API client contracts", () => {
 
     assert.deepEqual(created, { id: "activity-1" });
     const request = graphqlRequest(requests[0]!.body);
-    assert.match(
-      request.query,
-      /mutation PaseoAgentActivityCreate\(\$input: AgentActivityCreateInput!\)/u,
-    );
-    assert.match(
-      request.query,
-      /agentActivityCreate\(input: \$input\) \{ success agentActivity \{ id \} \}/u,
-    );
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.agentActivityCreate);
     assert.deepEqual(request.variables, {
       input: {
         agentSessionId: "session-1",
@@ -711,11 +709,7 @@ describe("Linear API client contracts", () => {
     });
 
     const request = graphqlRequest(requests[0]!.body);
-    assert.match(
-      request.query,
-      /mutation PaseoAgentSessionUpdate\(\$id: String!, \$input: AgentSessionUpdateInput!\)/u,
-    );
-    assert.match(request.query, /agentSessionUpdate\(id: \$id, input: \$input\) \{ success \}/u);
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.agentSessionUpdate);
     assert.deepEqual(request.variables, {
       id: "session-1",
       input: {
@@ -768,7 +762,7 @@ describe("Linear API client contracts", () => {
                   createdAt: "2023-11-14T22:13:19.002Z",
                   signal: null,
                   user: { id: "app-user", name: null },
-                  content: { __typename: "AgentActivityActionContent" },
+                  content: { __typename: "AgentActivityElicitationContent", body: "Which one?" },
                 },
                 {
                   id: "activity-1",
@@ -776,6 +770,13 @@ describe("Linear API client contracts", () => {
                   signal: "stop",
                   user: { id: "user-1", name: "Ada" },
                   content: { __typename: "AgentActivityPromptContent", body: "Please fix" },
+                },
+                {
+                  id: "activity-trigger",
+                  createdAt: "2023-11-14T22:13:19.000Z",
+                  signal: null,
+                  user: { id: "user-1", name: "Ada" },
+                  content: { __typename: "AgentActivityPromptContent", body: "The trigger" },
                 },
                 {
                   id: "activity-0",
@@ -796,6 +797,7 @@ describe("Linear API client contracts", () => {
       linearOrganizationId: "linear-org",
       agentSessionId: "session-1",
       beforeCreatedAt: "2023-11-14T22:13:19.004Z",
+      excludeActivityId: "activity-trigger",
     });
 
     assert.deepEqual(history, {
@@ -813,7 +815,7 @@ describe("Linear API client contracts", () => {
           createdAt: "2023-11-14T22:13:19.002Z",
           signal: null,
           user: { id: "app-user" },
-          content: { type: "action" },
+          content: { type: "elicitation", body: "Which one?" },
         },
         {
           id: "activity-3",
@@ -825,20 +827,16 @@ describe("Linear API client contracts", () => {
       ],
     });
     const request = graphqlRequest(requests[0]!.body);
-    assert.match(
-      request.query,
-      /query PaseoAgentSessionActivities\(\$id: String!, \$before: DateTimeOrDuration!\)/u,
-    );
-    assert.match(request.query, /last: 49/u);
-    assert.match(request.query, /orderBy: createdAt/u);
-    assert.match(request.query, /filter: \{ createdAt: \{ lt: \$before \} \}/u);
-    for (const content of ["Prompt", "Response", "Error", "Elicitation"]) {
-      assert.ok(
-        request.query.includes(`... on AgentActivity${content}Content { body }`),
-        `query lacks the ${content} fragment`,
-      );
-    }
-    assert.deepEqual(request.variables, { id: "session-1", before: "2023-11-14T22:13:19.004Z" });
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.agentSessionActivities);
+    // The server keeps the 49-activity window to the conversation: the mirror's thoughts and
+    // actions never crowd it out.
+    assert.deepEqual(request.variables, {
+      id: "session-1",
+      filter: {
+        createdAt: { lt: "2023-11-14T22:13:19.004Z" },
+        type: { in: ["prompt", "response", "error", "elicitation"] },
+      },
+    });
   });
 
   it("reads a team's workflow states in display order", async () => {
@@ -869,11 +867,7 @@ describe("Linear API client contracts", () => {
       { id: "state-done", name: "Done", type: "completed", position: 3 },
     ]);
     const request = graphqlRequest(requests[0]!.body);
-    assert.match(request.query, /query PaseoTeamStates\(\$id: String!\)/u);
-    assert.match(
-      request.query,
-      /team\(id: \$id\) \{ states \{ nodes \{ id name type position \} \} \}/u,
-    );
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.teamStates);
     assert.deepEqual(request.variables, { id: "team-1" });
   });
 
@@ -893,11 +887,7 @@ describe("Linear API client contracts", () => {
     });
 
     const request = graphqlRequest(requests[0]!.body);
-    assert.match(
-      request.query,
-      /mutation PaseoIssueUpdate\(\$id: String!, \$input: IssueUpdateInput!\)/u,
-    );
-    assert.match(request.query, /issueUpdate\(id: \$id, input: \$input\) \{ success \}/u);
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.issueUpdate);
     assert.deepEqual(request.variables, {
       id: "issue-1",
       input: { stateId: "state-progress", delegateId: "app-user" },
@@ -926,14 +916,7 @@ describe("Linear API client contracts", () => {
     });
 
     const request = graphqlRequest(requests[0]!.body);
-    assert.match(
-      request.query,
-      /mutation PaseoAttachmentLinkGitHubPR\(\$issueId: String!, \$url: String!, \$title: String\)/u,
-    );
-    assert.match(
-      request.query,
-      /attachmentLinkGitHubPR\(issueId: \$issueId, url: \$url, title: \$title\) \{ success \}/u,
-    );
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.attachmentLinkGitHubPR);
     assert.deepEqual(request.variables, {
       issueId: "issue-1",
       url: "https://github.com/acme/app/pull/7",
@@ -943,6 +926,72 @@ describe("Linear API client contracts", () => {
       issueId: "issue-1",
       url: "https://github.com/acme/app/pull/8",
     });
+  });
+
+  it("links any URL to an issue as the fallback for workspaces without a GitHub integration", async () => {
+    const { api, requests } = apiClient(() =>
+      json({ data: { attachmentLinkURL: { success: true } } }),
+    );
+
+    await api.linkUrl({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      url: "https://github.com/acme/app/pull/7",
+      title: "Fix login",
+    });
+    await api.linkUrl({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      url: "https://hub.test/o/acme/activity",
+    });
+
+    const request = graphqlRequest(requests[0]!.body);
+    assert.equal(request.query, LINEAR_GRAPHQL_DOCUMENTS.attachmentLinkURL);
+    assert.deepEqual(request.variables, {
+      issueId: "issue-1",
+      url: "https://github.com/acme/app/pull/7",
+      title: "Fix login",
+    });
+    assert.deepEqual(graphqlRequest(requests[1]!.body).variables, {
+      issueId: "issue-1",
+      url: "https://hub.test/o/acme/activity",
+    });
+
+    const refused = apiClient(() => json({ data: { attachmentLinkURL: { success: false } } }));
+    await assert.rejects(
+      refused.api.linkUrl({
+        linearOrganizationId: "linear-org",
+        issueId: "issue-1",
+        url: "https://hub.test/o/acme/activity",
+      }),
+      /Linear link was not accepted/u,
+    );
+  });
+
+  it("sends every document it knows in a form the introspected Linear schema accepts", () => {
+    const schema = buildSchema(
+      readFileSync(new URL("./fixtures/linear-schema.graphql", import.meta.url), "utf8"),
+    );
+    assert.deepEqual(Object.keys(LINEAR_GRAPHQL_DOCUMENTS).sort(), [
+      "agentActivityCreate",
+      "agentSessionActivities",
+      "agentSessionUpdate",
+      "attachmentLinkGitHubPR",
+      "attachmentLinkURL",
+      "commentCreate",
+      "issue",
+      "issueCommentHistory",
+      "issueUpdate",
+      "teamStates",
+      "viewer",
+    ]);
+    for (const [name, document] of Object.entries(LINEAR_GRAPHQL_DOCUMENTS)) {
+      assert.deepEqual(
+        validate(schema, parse(document)).map((error) => error.message),
+        [],
+        `document ${name} is not valid against the Linear schema`,
+      );
+    }
   });
 
   it("reports HTTP failures and GraphQL errors as LinearApiError with status and code", async () => {
@@ -976,7 +1025,84 @@ describe("Linear API client contracts", () => {
         error instanceof LinearApiError &&
         error.status === 200 &&
         error.code === "FORBIDDEN" &&
+        error.retryAfterMs === undefined &&
         error.message === "Linear GraphQL Entity not found: AgentSession",
+    );
+  });
+
+  it("reads Linear's rate limit as a RATELIMITED GraphQL error on HTTP 400 with a reset horizon", async () => {
+    const { api } = apiClient(
+      () =>
+        new Response(
+          JSON.stringify({
+            errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }],
+          }),
+          {
+            status: 400,
+            headers: {
+              "content-type": "application/json",
+              "x-ratelimit-requests-reset": "1700000030000",
+              "x-ratelimit-complexity-reset": "1700000045000",
+            },
+          },
+        ),
+      { now: () => new Date(1_700_000_000_000) },
+    );
+
+    await assert.rejects(
+      api.readTeamStates({ linearOrganizationId: "linear-org", teamId: "team-1" }),
+      (error: unknown) =>
+        error instanceof LinearApiError &&
+        error.status === 400 &&
+        error.code === "RATELIMITED" &&
+        error.retryAfterMs === 45_000 &&
+        error.message === "Linear GraphQL HTTP 400: Rate limit exceeded",
+    );
+
+    const elapsed = apiClient(
+      () =>
+        new Response(JSON.stringify({ errors: [{ message: "Rate limit exceeded" }] }), {
+          status: 400,
+          headers: {
+            "content-type": "application/json",
+            "x-ratelimit-requests-reset": "1699999999000",
+          },
+        }),
+      { now: () => new Date(1_700_000_000_000) },
+    );
+    await assert.rejects(
+      elapsed.api.readTeamStates({ linearOrganizationId: "linear-org", teamId: "team-1" }),
+      (error: unknown) =>
+        error instanceof LinearApiError &&
+        error.status === 400 &&
+        error.code === undefined &&
+        error.retryAfterMs === 0,
+    );
+  });
+
+  it("abandons a GraphQL request that outlives the configured timeout", async () => {
+    const signals: Array<AbortSignal | null | undefined> = [];
+    const { api } = apiClient(() => json({ data: { team: { states: { nodes: [] } } } }), {
+      timeoutMs: 5,
+      fetch: (init) =>
+        new Promise<Response>((_resolve, reject) => {
+          signals.push(init?.signal);
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }),
+    });
+
+    await assert.rejects(
+      api.readTeamStates({ linearOrganizationId: "linear-org", teamId: "team-1" }),
+      (error: unknown) => error instanceof Error && error.name === "TimeoutError",
+    );
+    assert.equal(signals.length, 1);
+    assert.ok(signals[0] instanceof AbortSignal);
+
+    const unbounded = apiClient(() => json({ data: { team: { states: { nodes: [] } } } }));
+    await unbounded.api.readTeamStates({ linearOrganizationId: "linear-org", teamId: "team-1" });
+    assert.equal(
+      graphqlRequest(unbounded.requests[0]!.body).query,
+      LINEAR_GRAPHQL_DOCUMENTS.teamStates,
     );
   });
 
@@ -1054,7 +1180,15 @@ function linearConnection(): LinearConnectionRecord {
 }
 
 /** An API client over a usable token, recording every GraphQL request it sends. */
-function apiClient(respond: () => Response): {
+function apiClient(
+  respond: () => Response,
+  options: {
+    now?: () => Date;
+    timeoutMs?: number;
+    /** Replaces the default transport, which answers with `respond()` right away. */
+    fetch?: (init: RequestInit | undefined) => Promise<Response>;
+  } = {},
+): {
   api: LinearApiClient;
   requests: Array<{ authorization: string | null; body: string }>;
 } {
@@ -1064,12 +1198,14 @@ function apiClient(respond: () => Response): {
     connectionForLinearOrganization: async () => connection,
     withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
     connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+    ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     fetch: async (_url, init) => {
       requests.push({
         authorization: new Headers(init?.headers).get("authorization"),
         body: readableBody(init?.body),
       });
-      return respond();
+      return options.fetch === undefined ? respond() : options.fetch(init);
     },
   });
   return { api, requests };

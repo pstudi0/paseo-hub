@@ -205,7 +205,27 @@ describe("ProjectConfigurationStore resource compilation", () => {
       receivedAt: new Date(0),
     });
     assert.equal(accepted.status, "accepted");
-    if (accepted.status === "accepted") assert.equal(accepted.events[0]?.projectId, project.id);
+    if (accepted.status !== "accepted") throw new Error("expected an accepted event");
+    assert.equal(accepted.events[0]?.projectId, project.id);
+    assert.equal("replayed" in accepted, false);
+
+    // Linear re-signs a redelivered body, so a replay carries the same delivery key under another
+    // signature: the receipt answers with the events it handed out the first time and says so.
+    const replayed = await database.acceptLinearEvent({
+      linearOrganizationId: linear.linearOrganizationId,
+      resourceId: "linear-project-1",
+      deliveryId: "linear-scout-entry",
+      signatureHash: "linear-scout-entry-redelivered",
+      source: "linear.issue",
+      payload: {},
+      receivedAt: new Date(5_000),
+    });
+    assert.deepEqual(replayed, {
+      status: "accepted",
+      receiptId: accepted.receiptId,
+      replayed: true,
+      events: accepted.events,
+    });
 
     database.findLinearConnection = async (linearOrganizationId) =>
       linearOrganizationId === linear.linearOrganizationId
@@ -223,6 +243,19 @@ describe("ProjectConfigurationStore resource compilation", () => {
     if (underScoped.status === "dropped") {
       assert.equal(underScoped.reason, "configuration_unavailable");
     }
+    // A dropped receipt replays as the same drop; only accepted routes are ever marked replayed.
+    assert.deepEqual(
+      await database.acceptLinearEvent({
+        linearOrganizationId: linear.linearOrganizationId,
+        resourceId: "linear-project-1",
+        deliveryId: "linear-scout-under-scoped",
+        signatureHash: "linear-scout-under-scoped-redelivered",
+        source: "linear.issue",
+        payload: {},
+        receivedAt: new Date(2),
+      }),
+      { status: "dropped", receiptId: underScoped.receiptId, reason: "configuration_unavailable" },
+    );
 
     database.findLinearConnection = async (linearOrganizationId) =>
       linearOrganizationId === linear.linearOrganizationId

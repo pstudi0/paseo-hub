@@ -263,6 +263,7 @@ function unusedLinearApiClient(overrides: Partial<LinearApiClient>): LinearApiCl
     readTeamStates: unused("readTeamStates"),
     updateIssue: unused("updateIssue"),
     linkGitHubPullRequest: unused("linkGitHubPullRequest"),
+    linkUrl: unused("linkUrl"),
     ...overrides,
   };
 }

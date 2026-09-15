@@ -111,6 +111,7 @@
     "@typescript/native-preview": "7.0.0-dev.20260423.1",
     "@vitejs/plugin-react": "5.2.0",
     "drizzle-kit": "0.31.10",
+    "graphql": "^16.14.2",
     "lefthook": "^2.1.6",
     "oxfmt": "0.46.0",
     "oxlint": "1.61.0",
