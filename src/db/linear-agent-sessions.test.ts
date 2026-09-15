@@ -23,7 +23,7 @@ const connection: LinearConnectionRecord = {
   accessToken: "access-token",
   refreshToken: "refresh-token",
   accessTokenExpiresAt: null,
-  scopes: ["read", "comments:create"],
+  scopes: ["read", "write", "comments:create", "app:assignable", "app:mentionable"],
   teamAccess: null,
 };
 

@@ -268,12 +268,14 @@ function createLinearConnection(
         connectionAccess(access),
       );
       if (disconnected.provider === "linear" && disconnected.accessToken !== undefined) {
-        void client?.revoke(disconnected.accessToken).catch((error: unknown) => {
-          logger.warn(
-            { err: error, provider: "linear" },
-            "provider cleanup failed after disconnect",
-          );
-        });
+        void client
+          ?.revoke(disconnected.accessToken, disconnected.refreshToken)
+          .catch((error: unknown) => {
+            logger.warn(
+              { err: error, provider: "linear" },
+              "provider cleanup failed after disconnect",
+            );
+          });
       }
       return Response.json({ disconnected: true });
     } catch (error) {

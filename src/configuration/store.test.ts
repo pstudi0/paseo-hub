@@ -299,10 +299,10 @@ describe("ProjectConfigurationStore resource compilation", () => {
     database.findLinearConnection = async (linearOrganizationId) =>
       linearOrganizationId === linear.linearOrganizationId ? linear : undefined;
     // The route's resource is the team, so a session webhook routed by `session.issue.teamId`
-    // reaches this project (the webhook side names it `resourceId`; the store still says `projectId`).
+    // reaches this project.
     const accepted = await database.acceptLinearEvent({
       linearOrganizationId: linear.linearOrganizationId,
-      projectId: team,
+      resourceId: team,
       deliveryId: "linear-session-created",
       source: "linear.agent_session",
       payload: {},

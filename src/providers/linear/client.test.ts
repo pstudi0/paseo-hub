@@ -1049,6 +1049,7 @@ function linearConnection(): LinearConnectionRecord {
     refreshToken: "refresh-token",
     accessTokenExpiresAt: null,
     scopes: GRANTED_SCOPES,
+    teamAccess: null,
   };
 }
 
