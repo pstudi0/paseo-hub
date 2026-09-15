@@ -13,6 +13,7 @@ import {
   createLinearApiClient,
   createLinearConnectionClient,
   hasRequiredLinearScopes,
+  LINEAR_API_TIMEOUT_CODE,
   LINEAR_GRAPHQL_DOCUMENTS,
   LINEAR_REQUIRED_SCOPES,
   LinearApiError,
@@ -785,6 +786,13 @@ describe("Linear API client contracts", () => {
                   user: null,
                   content: { __typename: "AgentActivityFutureContent", body: "unknown" },
                 },
+                {
+                  id: "activity-thought",
+                  createdAt: "2023-11-14T22:13:18.999Z",
+                  signal: null,
+                  user: { id: "app-user", name: "Paseo" },
+                  content: { __typename: "AgentActivityThoughtContent", body: "Thinking" },
+                },
               ],
               pageInfo: { hasPreviousPage: true },
             },
@@ -1005,15 +1013,29 @@ describe("Linear API client contracts", () => {
         error.message === "Linear GraphQL HTTP 429",
     );
 
-    const forbidden = apiClient(() =>
-      json({
-        errors: [
+    // Linear sends its window-reset headers on every response: only a rate limit turns them into a
+    // back-off signal.
+    const forbidden = apiClient(
+      () =>
+        new Response(
+          JSON.stringify({
+            errors: [
+              {
+                message: "Entity not found: AgentSession",
+                extensions: { code: "FORBIDDEN", type: "invalid input" },
+              },
+            ],
+          }),
           {
-            message: "Entity not found: AgentSession",
-            extensions: { code: "FORBIDDEN", type: "invalid input" },
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "x-ratelimit-requests-reset": "1700000030000",
+              "x-ratelimit-complexity-reset": "1700000045000",
+            },
           },
-        ],
-      }),
+        ),
+      { now: () => new Date(1_700_000_000_000) },
     );
     await assert.rejects(
       forbidden.api.updateAgentSession({
@@ -1061,13 +1083,18 @@ describe("Linear API client contracts", () => {
 
     const elapsed = apiClient(
       () =>
-        new Response(JSON.stringify({ errors: [{ message: "Rate limit exceeded" }] }), {
-          status: 400,
-          headers: {
-            "content-type": "application/json",
-            "x-ratelimit-requests-reset": "1699999999000",
+        new Response(
+          JSON.stringify({
+            errors: [{ message: "Rate limit exceeded", extensions: { code: "RATELIMITED" } }],
+          }),
+          {
+            status: 400,
+            headers: {
+              "content-type": "application/json",
+              "x-ratelimit-requests-reset": "1699999999000",
+            },
           },
-        }),
+        ),
       { now: () => new Date(1_700_000_000_000) },
     );
     await assert.rejects(
@@ -1075,8 +1102,25 @@ describe("Linear API client contracts", () => {
       (error: unknown) =>
         error instanceof LinearApiError &&
         error.status === 400 &&
-        error.code === undefined &&
+        error.code === "RATELIMITED" &&
         error.retryAfterMs === 0,
+    );
+
+    const http429 = apiClient(
+      () =>
+        new Response("slow down", {
+          status: 429,
+          headers: { "x-ratelimit-requests-reset": "1700000010000" },
+        }),
+      { now: () => new Date(1_700_000_000_000) },
+    );
+    await assert.rejects(
+      http429.api.readTeamStates({ linearOrganizationId: "linear-org", teamId: "team-1" }),
+      (error: unknown) =>
+        error instanceof LinearApiError &&
+        error.status === 429 &&
+        error.code === undefined &&
+        error.retryAfterMs === 10_000,
     );
   });
 
@@ -1093,7 +1137,14 @@ describe("Linear API client contracts", () => {
 
     await assert.rejects(
       api.readTeamStates({ linearOrganizationId: "linear-org", teamId: "team-1" }),
-      (error: unknown) => error instanceof Error && error.name === "TimeoutError",
+      (error: unknown) =>
+        error instanceof LinearApiError &&
+        error.status === 0 &&
+        error.code === LINEAR_API_TIMEOUT_CODE &&
+        error.retryAfterMs === undefined &&
+        error.message === "Linear GraphQL request timed out after 5ms" &&
+        error.cause instanceof Error &&
+        error.cause.name === "TimeoutError",
     );
     assert.equal(signals.length, 1);
     assert.ok(signals[0] instanceof AbortSignal);

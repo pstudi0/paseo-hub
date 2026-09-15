@@ -23,9 +23,13 @@ const LINEAR_ACCESS_TOKEN_REFRESH_SKEW_MS = 60_000;
 
 /**
  * The `AgentActivityType` values that make up a session's conversation. The history window counts
- * these only: the thoughts and actions a mirror emits are noise when a session is replayed.
+ * these only: the thoughts and actions a mirror emits are noise when a session is replayed, so
+ * the client never reads them back and `LinearAgentSessionActivity` has no variant for them.
  */
 const LINEAR_CONVERSATION_ACTIVITY_TYPES = ["prompt", "response", "error", "elicitation"] as const;
+
+/** A GraphQL request abandoned by `timeoutMs` surfaces as a `LinearApiError` with this code. */
+export const LINEAR_API_TIMEOUT_CODE = "TIMEOUT";
 
 /**
  * Every GraphQL document the client sends, keyed by operation. Documents are static and complete:
@@ -208,22 +212,17 @@ const AgentSessionUpdateResponseSchema = z.object({
   data: z.object({ agentSessionUpdate: z.object({ success: z.boolean() }) }),
 });
 
-export type LinearAgentSessionActivityType =
-  | "prompt"
-  | "response"
-  | "error"
-  | "elicitation"
-  | "thought"
-  | "action";
+export type LinearAgentSessionActivityType = (typeof LINEAR_CONVERSATION_ACTIVITY_TYPES)[number];
 
-/** GraphQL `__typename` of each `AgentActivityContent` member, by its `AgentActivityType` value. */
+/**
+ * GraphQL `__typename` of each conversational `AgentActivityContent` member, by its
+ * `AgentActivityType` value; any other member is dropped by `normalizeAgentSessionActivity`.
+ */
 const ACTIVITY_CONTENT_TYPENAMES: ReadonlyMap<string, LinearAgentSessionActivityType> = new Map([
   ["AgentActivityPromptContent", "prompt"],
   ["AgentActivityResponseContent", "response"],
   ["AgentActivityErrorContent", "error"],
   ["AgentActivityElicitationContent", "elicitation"],
-  ["AgentActivityThoughtContent", "thought"],
-  ["AgentActivityActionContent", "action"],
 ]);
 
 const AgentSessionActivityNodeSchema = z.object({
@@ -284,17 +283,24 @@ const AttachmentLinkURLResponseSchema = z.object({
  * HTTP status (401/403: reauthorize) or to the GraphQL error code Linear attaches under
  * `extensions.code`. Linear reports an exhausted quota as a GraphQL error with the code
  * `RATELIMITED` on an HTTP 400, not as an HTTP 429, so the body is read on failed responses too;
- * a GraphQL-level error carries the HTTP status of its transport (200). `retryAfterMs` is the
- * time until the later of the request and complexity rate-limit windows resets, when Linear
- * reported either.
+ * a GraphQL-level error carries the HTTP status of its transport (200). `retryAfterMs` is set on
+ * rate-limit failures only (HTTP 429 or code `RATELIMITED`): the time until the later of the
+ * request and complexity rate-limit windows resets, when Linear reported either. Linear sends
+ * those headers on every response, so other failures leave it undefined rather than carrying the
+ * remaining window as a back-off signal. A request abandoned by `timeoutMs` is reported with
+ * `status: 0` and `code: LINEAR_API_TIMEOUT_CODE`.
  */
 export class LinearApiError extends Error {
   readonly status: number;
   readonly code: string | undefined;
   readonly retryAfterMs: number | undefined;
 
-  constructor(message: string, details: { status: number; code?: string; retryAfterMs?: number }) {
-    super(message);
+  constructor(
+    message: string,
+    details: { status: number; code?: string; retryAfterMs?: number },
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
     this.name = "LinearApiError";
     this.status = details.status;
     this.code = details.code;
@@ -362,18 +368,15 @@ export interface LinearPlanStep {
 }
 
 /**
- * One activity read back from a session, discriminated by Linear's `AgentActivityType`. Only the
- * conversational types carry a body; thoughts and actions are reported by type so a reader can see
- * they happened without replaying them.
+ * One conversational activity read back from a session, discriminated by Linear's
+ * `AgentActivityType`. Thoughts and actions are filtered out server side and never surface here.
  */
 export interface LinearAgentSessionActivity {
   id: string;
   createdAt: string;
   signal: string | null;
   user: { id: string; name?: string } | null;
-  content:
-    | { type: "prompt" | "response" | "error" | "elicitation"; body: string }
-    | { type: "thought" | "action" };
+  content: { type: LinearAgentSessionActivityType; body: string };
 }
 
 export interface LinearAgentSessionActivityHistory {
@@ -914,8 +917,7 @@ function normalizeAgentSessionActivity(
 ): LinearAgentSessionActivity | undefined {
   const type = ACTIVITY_CONTENT_TYPENAMES.get(node.content.__typename);
   if (type === undefined) return undefined;
-  const content: LinearAgentSessionActivity["content"] =
-    type === "thought" || type === "action" ? { type } : { type, body: node.content.body ?? "" };
+  const content: LinearAgentSessionActivity["content"] = { type, body: node.content.body ?? "" };
   return {
     id: node.id,
     createdAt: node.createdAt,
@@ -991,19 +993,29 @@ async function graphql(
   payload: { query: string; variables: Record<string, unknown> },
   transport: { now: () => Date; timeoutMs?: number },
 ): Promise<unknown> {
-  const response = await request("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(payload),
-    ...(transport.timeoutMs === undefined
-      ? {}
-      : { signal: AbortSignal.timeout(transport.timeoutMs) }),
-  });
-  const retryAfterMs = readRetryAfterMs(response.headers, transport.now());
-  const retry = retryAfterMs === undefined ? {} : { retryAfterMs };
+  let response: Response;
+  try {
+    response = await request("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      ...(transport.timeoutMs === undefined
+        ? {}
+        : { signal: AbortSignal.timeout(transport.timeoutMs) }),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw new LinearApiError(
+        `Linear GraphQL request timed out after ${transport.timeoutMs}ms`,
+        { status: 0, code: LINEAR_API_TIMEOUT_CODE },
+        { cause: error },
+      );
+    }
+    throw error;
+  }
   if (!response.ok) {
     const failure = readGraphqlFailure(await readJson(response));
     throw new LinearApiError(
@@ -1013,7 +1025,7 @@ async function graphql(
       {
         status: response.status,
         ...(failure?.code === undefined ? {} : { code: failure.code }),
-        ...retry,
+        ...rateLimitRetry(response, failure?.code, transport.now()),
       },
     );
   }
@@ -1023,10 +1035,25 @@ async function graphql(
     throw new LinearApiError(`Linear GraphQL ${failure.message}`, {
       status: response.status,
       ...(failure.code === undefined ? {} : { code: failure.code }),
-      ...retry,
+      ...rateLimitRetry(response, failure.code, transport.now()),
     });
   }
   return result;
+}
+
+/**
+ * The `retryAfterMs` of a rate-limit failure only: Linear attaches its window-reset headers to
+ * every response, so reading them on any other failure would hand callers a back-off for an
+ * error that waiting cannot fix.
+ */
+function rateLimitRetry(
+  response: Response,
+  code: string | undefined,
+  now: Date,
+): { retryAfterMs?: number } {
+  if (response.status !== 429 && code !== "RATELIMITED") return {};
+  const retryAfterMs = readRetryAfterMs(response.headers, now);
+  return retryAfterMs === undefined ? {} : { retryAfterMs };
 }
 
 /** The first GraphQL error of a response body, when the body carries any. */
