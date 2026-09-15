@@ -828,3 +828,302 @@ describe("workflow compiler", () => {
 function setAgent(raw: ReturnType<typeof configuration>, agent: unknown): void {
   Reflect.set(raw.triggers[0]!.steps[0]!, "agent", agent);
 }
+
+const ISSUE_ONLY_FILTER_VALUES: Record<string, unknown> = {
+  project: "p",
+  states: ["x"],
+  assignees: ["x"],
+  labels: ["x"],
+  exclude_labels: ["x"],
+  pattern: "x",
+  contains: "x",
+};
+
+function withContinuation(compiled: CompiledHubConfig, mode: "linear" | "conversation") {
+  const stored = structuredClone({
+    environments: compiled.environments,
+    triggers: compiled.triggers,
+  });
+  for (const trigger of stored.triggers) {
+    for (const step of trigger.steps) step.continuation = { mode };
+  }
+  return stored;
+}
+
+function newBranchOf(compiled: CompiledHubConfig): string | undefined {
+  const [first] = compiled.environments;
+  if (first?.kind !== "daemon" || first.worktree?.mode !== "branch-off") return undefined;
+  return first.worktree.newBranch;
+}
+
+describe("Linear agent session configuration", () => {
+  const TEAM = "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01";
+
+  function sessionTrigger(
+    on: "linear.agent_session_created" | "linear.agent_session_prompted",
+    overrides: Record<string, unknown> = {},
+  ) {
+    const base = configuration().triggers[0]!;
+    return {
+      ...base,
+      name: on === "linear.agent_session_created" ? "delegated" : "followed-up",
+      on,
+      filters: {
+        team: TEAM,
+        from_users: on === "linear.agent_session_created" ? ["user-anthony"] : ["*"],
+      },
+      ...overrides,
+    };
+  }
+
+  it("compiles session filters and the linear authority block into a re-readable contract", () => {
+    const compiled = compileHubConfig({
+      ...configuration(),
+      triggers: [
+        sessionTrigger("linear.agent_session_created", {
+          filters: {
+            team: TEAM,
+            from_users: ["user-anthony"],
+            source: ["delegation", "mention"],
+            allow_automations: true,
+          },
+          steps: [
+            {
+              ...configuration().triggers[0]!.steps[0]!,
+              linear: { on_start: "started", on_pull_request: "In Review", delegate: true },
+            },
+          ],
+        }),
+      ],
+    });
+    assert.deepEqual(compiled.triggers[0]?.filters, {
+      team: TEAM,
+      from_users: ["user-anthony"],
+      source: ["delegation", "mention"],
+      allow_automations: true,
+    });
+    assert.deepEqual(compiled.triggers[0]?.steps[0]?.linear, {
+      onStart: { kind: "type", type: "started" },
+      onPullRequest: { kind: "name", name: "In Review" },
+      delegate: true,
+      mirror: { actions: true, thoughts: "summary", plan: true, permissions: true },
+    });
+    assert.deepEqual(parseCompiledHubConfig(structuredClone(compiled)), compiled);
+    assert.equal(compiledConfigurationHash(compiled), compiledConfigurationHash(compiled));
+  });
+
+  it("requires a team and named humans for a delegation, and any allowlist for a follow-up", () => {
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...configuration(),
+          triggers: [
+            sessionTrigger("linear.agent_session_created", { filters: { from_users: ["u"] } }),
+          ],
+        }),
+      /trigger delegated requires filters\.team for linear\.agent_session_created/u,
+    );
+    for (const from_users of [["*"], [], ["user-anthony", "*"]]) {
+      assert.throws(
+        () =>
+          compileHubConfig({
+            ...configuration(),
+            triggers: [
+              sessionTrigger("linear.agent_session_created", {
+                filters: { team: TEAM, ...(from_users.length === 0 ? {} : { from_users }) },
+              }),
+            ],
+          }),
+        /requires explicit Linear user IDs in filters\.from_users for linear\.agent_session_created; "\*" is not allowed/u,
+      );
+    }
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...configuration(),
+          triggers: [sessionTrigger("linear.agent_session_prompted", { filters: { team: TEAM } })],
+        }),
+      /trigger followed-up requires a non-empty filters\.from_users allowlist for linear\.agent_session_prompted/u,
+    );
+    assert.doesNotThrow(() =>
+      compileHubConfig({
+        ...configuration(),
+        triggers: [sessionTrigger("linear.agent_session_prompted")],
+      }),
+    );
+  });
+
+  it.each(["project", "states", "assignees", "labels", "exclude_labels", "pattern", "contains"])(
+    "refuses the issue-only filter %s on a session event",
+    (key) => {
+      const value = ISSUE_ONLY_FILTER_VALUES[key];
+      assert.throws(
+        () =>
+          compileHubConfig({
+            ...configuration(),
+            triggers: [
+              sessionTrigger("linear.agent_session_created", {
+                filters: { team: TEAM, from_users: ["u"], [key]: value },
+              }),
+            ],
+          }),
+        (error) => {
+          assert.ok(error instanceof Error);
+          assert.deepEqual(Reflect.get(error, "path"), ["triggers", "delegated", "filters"]);
+          assert.match(
+            error.message,
+            new RegExp(
+              `filters\\.${key} is not available for linear\\.agent_session_created; the session payload carries no such field`,
+              "u",
+            ),
+          );
+          return true;
+        },
+      );
+    },
+  );
+
+  it.each([
+    ["team", TEAM],
+    ["source", ["delegation"]],
+    ["allow_automations", true],
+  ])("refuses the session-only filter %s on an issue event", (key, value) => {
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...configuration(),
+          triggers: [
+            {
+              ...configuration().triggers[0]!,
+              on: "linear.issue_assigned",
+              filters: { from_users: ["u"], [key]: value },
+            },
+          ],
+        }),
+      new RegExp(
+        `trigger run filters\\.${key} is only available for linear\\.agent_session_created and linear\\.agent_session_prompted`,
+        "u",
+      ),
+    );
+  });
+
+  it("refuses the linear block and the linear continuation outside session events", () => {
+    const base = configuration();
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...base,
+          triggers: [
+            {
+              ...base.triggers[0]!,
+              steps: [{ ...base.triggers[0]!.steps[0]!, linear: { on_start: "started" } }],
+            },
+          ],
+        }),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.deepEqual(Reflect.get(error, "path"), [
+          "triggers",
+          "run",
+          "steps",
+          "work",
+          "linear",
+        ]);
+        assert.match(
+          error.message,
+          /trigger run step work linear is only available for linear\.agent_session_created and linear\.agent_session_prompted/u,
+        );
+        return true;
+      },
+    );
+    assert.throws(
+      () => parseCompiledHubConfig(withContinuation(compileHubConfig(base), "linear")),
+      /active configuration contains an invalid compiled workflow contract/u,
+    );
+    const session = compileHubConfig({
+      ...base,
+      triggers: [sessionTrigger("linear.agent_session_prompted")],
+    });
+    assert.doesNotThrow(() => parseCompiledHubConfig(withContinuation(session, "linear")));
+  });
+
+  it("lets only session-only environments name their branch after the Linear issue", () => {
+    const worktree = { mode: "branch-off", newBranch: "linear/${{ linear.issue.identifier }}" };
+    const sessionOnly = {
+      environments: [{ ...environment, worktree }],
+      triggers: [
+        sessionTrigger("linear.agent_session_created"),
+        sessionTrigger("linear.agent_session_prompted"),
+      ],
+    };
+    const compiled = compileHubConfig(sessionOnly);
+    assert.equal(newBranchOf(compiled), "linear/${{ linear.issue.identifier }}");
+    assert.deepEqual(parseCompiledHubConfig(structuredClone(compiled)), compiled);
+    for (const intruder of [
+      configuration().triggers[0]!,
+      {
+        ...configuration().triggers[0]!,
+        inputs: { where: { type: "string", choices: ["runner"] } },
+        steps: [
+          { ...configuration().triggers[0]!.steps[0]!, environment: "${{ paseo.inputs.where }}" },
+        ],
+      },
+    ]) {
+      assert.throws(
+        () => compileHubConfig({ ...sessionOnly, triggers: [...sessionOnly.triggers, intruder] }),
+        (error) => {
+          assert.ok(error instanceof Error);
+          assert.deepEqual(Reflect.get(error, "path"), [
+            "environments",
+            "runner",
+            "worktree",
+            "newBranch",
+          ]);
+          assert.match(
+            error.message,
+            /environments\.runner\.worktree\.newBranch uses linear\.issue\.identifier but a non-Linear trigger targets this environment/u,
+          );
+          return true;
+        },
+      );
+    }
+  });
+
+  it("keeps linear.issue out of prompts, conditions, and values", () => {
+    const trigger = sessionTrigger("linear.agent_session_created");
+    const step = trigger.steps[0]!;
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...configuration(),
+          triggers: [
+            {
+              ...trigger,
+              steps: [{ ...step, prompt: [{ text: "${{ linear.issue.identifier }}" }] }],
+            },
+          ],
+        }),
+      /step work prompt\[0\] uses linear\.issue outside environment worktree\.newBranch/u,
+    );
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...configuration(),
+          triggers: [
+            { ...trigger, steps: [{ ...step, if: "${{ linear.issue.identifier == 'X' }}" }] },
+          ],
+        }),
+      /step work if uses linear\.issue outside environment worktree\.newBranch/u,
+    );
+    assert.throws(
+      () =>
+        compileHubConfig({
+          ...configuration(),
+          triggers: [
+            { ...trigger, values: { branch: "${{ linear.issue.identifier }}" }, steps: [step] },
+          ],
+        }),
+      /value branch uses linear\.issue outside environment worktree\.newBranch/u,
+    );
+  });
+});

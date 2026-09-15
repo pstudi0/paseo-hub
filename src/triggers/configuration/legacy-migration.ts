@@ -11,6 +11,7 @@ import type {
   JsonPrimitive,
 } from "../../config/compiler.js";
 import { parseCompiledHubConfig } from "../../config/compiler.js";
+import { authorLinearAuthority } from "../../config/linear-authority.js";
 import type { TriggerDocument } from "./schema.js";
 import { compileTriggerDocument, serializeTriggerDocument } from "./index.js";
 
@@ -171,6 +172,7 @@ function singleRunDocument(
               duration: duration(step.github.durationMs),
             },
           }),
+      ...(step.linear === undefined ? {} : { linear: authorLinearAuthority(step.linear) }),
       ...(step.output === undefined
         ? {}
         : { output: { schema: structuredClone(asJsonObject(step.output.schema)) } }),
@@ -236,6 +238,9 @@ function authoredFilters(
     guild: rest.guild,
     workspace: rest.workspace,
     project: rest.project,
+    team: rest.team,
+    source: rest.source === undefined ? undefined : [...rest.source],
+    allow_automations: rest.allow_automations,
     states: rest.states === undefined ? undefined : [...rest.states],
     exclude_labels: rest.exclude_labels === undefined ? undefined : [...rest.exclude_labels],
     assignees: rest.assignees === undefined ? undefined : [...rest.assignees],

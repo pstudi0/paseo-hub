@@ -1,4 +1,4 @@
-import { continuationKey } from "../triggers/continuation.js";
+import { continuationKey, continuationWorkspaceKey } from "../triggers/continuation.js";
 import { DatabaseUnavailableError } from "../db/errors.js";
 import type {
   AgentExecutionRecord,
@@ -42,6 +42,7 @@ import {
   renderExecutionTemplate,
   renderExpressionTemplate,
   type ExpressionContext,
+  type LinearExpressionContext,
 } from "./expression.js";
 import type { WorktreeTarget } from "../config/index.js";
 import type { Logger } from "pino";
@@ -930,6 +931,7 @@ function buildStepIntent(
     throw new Error(`workflow environment ${environmentName} is unavailable`);
   }
   const agent = materializeAgent(step.agent, context);
+  const linear = readLinearIssueExpressionContext(run.triggerContext);
   return {
     ...buildLaunchMachineIntent({
       organizationId: run.organizationId,
@@ -944,7 +946,7 @@ function buildStepIntent(
         cwd: environment.cwd,
         ...(environment.worktree === undefined
           ? {}
-          : { worktree: materializeExecutionWorktree(environment.worktree, executionId) }),
+          : { worktree: materializeExecutionWorktree(environment.worktree, executionId, linear) }),
       },
       ...(step.env === undefined ? {} : { env: step.env }),
       ...(step.github === undefined ? {} : { github: step.github }),
@@ -971,6 +973,7 @@ function buildStepIntent(
             key: continuationKey(step.continuation, run.conversation, (value) =>
               renderExpressionTemplate(value, context),
             ),
+            ...workspaceKeyIntent(continuationWorkspaceKey(step.continuation, run.conversation)),
             compatibility: {
               agent,
               target: environment,
@@ -1078,9 +1081,37 @@ function authorityString(value: string, field: string): string {
   return value;
 }
 
-function materializeExecutionWorktree(worktree: WorktreeTarget, executionId: string) {
+function materializeExecutionWorktree(
+  worktree: WorktreeTarget,
+  executionId: string,
+  linear: LinearExpressionContext | undefined,
+) {
   if (worktree.mode !== "branch-off") return worktree;
-  return { ...worktree, newBranch: renderExecutionTemplate(worktree.newBranch, executionId) };
+  return {
+    ...worktree,
+    newBranch: renderExecutionTemplate(worktree.newBranch, executionId, linear),
+  };
+}
+
+function workspaceKeyIntent(workspaceKey: string | null): { workspaceKey?: string } {
+  return workspaceKey === null ? {} : { workspaceKey };
+}
+
+/**
+ * The Linear issue identifier a `worktree.newBranch` template may read: present only on
+ * agent-session trigger contexts, which are the only triggers the compiler lets use it.
+ */
+function readLinearIssueExpressionContext(
+  triggerContext: unknown,
+): LinearExpressionContext | undefined {
+  if (!isRecord(triggerContext) || triggerContext["provider"] !== "linear") return undefined;
+  const event = triggerContext["event"];
+  if (!isRecord(event)) return undefined;
+  const linear = event["linear"];
+  if (!isRecord(linear) || linear["event_type"] !== "agent_session") return undefined;
+  const issue = linear["issue"];
+  if (!isRecord(issue) || typeof issue["identifier"] !== "string") return undefined;
+  return { issue: { identifier: issue["identifier"] } };
 }
 
 function inputContext(value: unknown): Readonly<Record<string, JsonPrimitive>> {

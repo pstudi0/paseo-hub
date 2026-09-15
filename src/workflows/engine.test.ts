@@ -91,6 +91,153 @@ describe("durable multi-step workflow engine", () => {
     },
   );
 
+  it("keys the workspace by issue and names the branch after the issue for Linear sessions", async () => {
+    const team = "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01";
+    const compiled = compileHubConfig({
+      environments: [
+        {
+          name: "runner",
+          kind: "daemon",
+          daemon: "runner",
+          cwd: "/workspace",
+          worktree: { mode: "branch-off", newBranch: "linear/${{ linear.issue.identifier }}" },
+        },
+      ],
+      triggers: [
+        {
+          name: "delegated",
+          on: "linear.agent_session_created",
+          max_runtime: "1h",
+          filters: { team, from_users: ["user-anthony"] },
+          steps: [
+            {
+              id: "run",
+              environment: "runner",
+              max_runtime: "10m",
+              idle_timeout: "1m",
+              agent: { provider: "codex" },
+              prompt: [{ text: "Take the issue." }],
+            },
+          ],
+        },
+      ],
+    });
+    const fixture = await workflowFixture({
+      compiledConfiguration: withContinuation(compiled, "linear"),
+    });
+    const baseProvider = providerMatch(fixture.configuration, fixture.revisionId);
+    const provider = {
+      ...baseProvider,
+      name: "linear",
+      async match(event) {
+        const [match] = await baseProvider.match(event);
+        assert.ok(match);
+        return [
+          {
+            ...match,
+            triggerContext: {
+              provider: "linear",
+              event: {
+                linear: {
+                  event_type: "agent_session",
+                  issue: { id: "issue-1", identifier: "SEN-42" },
+                },
+              },
+            },
+            outputContext: { provider: "linear" },
+            conversation: {
+              key: "linear:session:session-1",
+              label: "Linear session",
+              workspaceKey: "linear:issue:issue-1",
+            },
+          },
+        ];
+      },
+    } satisfies import("../triggers/index.js").TriggerProvider;
+    const intents: LaunchMachineIntent[] = [];
+    const { handler, engine } = createDurableWorkflowHandler({
+      database: fixture.database,
+      entitlements: fixture.entitlements,
+      providers: [provider],
+      dispatchLaunchMachineIntent: async (intent) => {
+        intents.push(intent);
+        const execution = await fixture.database.findAgentExecutionByWorkflowStepRunId(
+          intent.workflowStepRunId!,
+        );
+        assert.ok(execution);
+        return { execution };
+      },
+    });
+
+    await handler(fixture.trigger("the triggering body"));
+    await engine.processAvailable();
+
+    assert.equal(intents.length, 1);
+    const [intent] = intents;
+    assert.ok(intent);
+    assert.equal(
+      intent.environment.worktree?.mode === "branch-off"
+        ? intent.environment.worktree.newBranch
+        : undefined,
+      "linear/SEN-42",
+    );
+    assert.ok(intent.continuation);
+    assert.equal(intent.continuation.key, "linear:session:session-1");
+    assert.equal(intent.continuation.workspaceKey, "linear:issue:issue-1");
+    const execution = await fixture.database.findAgentExecutionByWorkflowStepRunId(
+      intent.workflowStepRunId!,
+    );
+    assert.equal(execution?.launchIntent?.continuation?.workspaceKey, "linear:issue:issue-1");
+  });
+
+  it("leaves the workspace key off intents whose continuation is not a Linear session", async () => {
+    const fixture = await workflowFixture({
+      compiledConfiguration: withContinuation(
+        compileHubConfig(executionWorktreeConfiguration()),
+        "conversation",
+      ),
+    });
+    const baseProvider = providerMatch(fixture.configuration, fixture.revisionId);
+    const provider = {
+      ...baseProvider,
+      async match(event) {
+        const [match] = await baseProvider.match(event);
+        assert.ok(match);
+        return [
+          {
+            ...match,
+            conversation: {
+              key: "thread-1",
+              label: "Thread",
+              workspaceKey: "linear:issue:issue-1",
+            },
+          },
+        ];
+      },
+    } satisfies import("../triggers/index.js").TriggerProvider;
+    const intents: LaunchMachineIntent[] = [];
+    const { handler, engine } = createDurableWorkflowHandler({
+      database: fixture.database,
+      entitlements: fixture.entitlements,
+      providers: [provider],
+      dispatchLaunchMachineIntent: async (intent) => {
+        intents.push(intent);
+        const execution = await fixture.database.findAgentExecutionByWorkflowStepRunId(
+          intent.workflowStepRunId!,
+        );
+        assert.ok(execution);
+        return { execution };
+      },
+    });
+    await handler(fixture.trigger("the triggering body"));
+    await engine.processAvailable();
+    assert.equal(intents.length, 1);
+    const [intent] = intents;
+    assert.ok(intent?.continuation);
+    assert.equal(intent.continuation.key, "thread-1");
+    assert.equal(Object.hasOwn(intent.continuation, "workspaceKey"), false);
+  });
+
   it("materializes ambient context only for the step that authors paseo.context", async () => {
     const fixture = await workflowFixture({ rawConfiguration: contextOptInConfiguration() });
     const prompts: string[] = [];
@@ -2008,6 +2155,20 @@ function terminalRecoveryConfiguration(): Record<string, unknown> {
       },
     ],
   };
+}
+
+function withContinuation(
+  compiled: CompiledHubConfig,
+  mode: "linear" | "conversation",
+): CompiledHubConfig {
+  const stored = structuredClone({
+    environments: compiled.environments,
+    triggers: compiled.triggers,
+  });
+  for (const trigger of stored.triggers) {
+    for (const step of trigger.steps) step.continuation = { mode };
+  }
+  return stored;
 }
 
 function executionWorktreeConfiguration(): Record<string, unknown> {

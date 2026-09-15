@@ -16,7 +16,12 @@ export interface DaemonEnvironmentTarget {
 }
 
 export interface LaunchMachineIntent {
-  continuation?: { key: string | null; compatibility: unknown };
+  continuation?: {
+    key: string | null;
+    /** The workspace a new agent is created in when the key selects none; Linear sessions only. */
+    workspaceKey?: string;
+    compatibility: unknown;
+  };
   kind: "launch_machine";
   organizationId: string;
   projectId: string;

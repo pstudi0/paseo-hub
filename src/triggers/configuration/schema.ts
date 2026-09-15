@@ -1,8 +1,14 @@
 import { RecurrenceSchema } from "../schedule/recurrence.js";
 import { z } from "zod";
 import { ContinuationSchema } from "../continuation.js";
-import { eventDefinition, isEditorEvent } from "./events.js";
+import {
+  eventDefinition,
+  isEditorEvent,
+  isLinearAgentSessionEvent,
+  LINEAR_SESSION_SOURCES,
+} from "./events.js";
 import { AuthoredGitHubAuthoritySchema } from "../../config/github-authority.js";
+import { AuthoredLinearAuthoritySchema } from "../../config/linear-authority.js";
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -42,6 +48,12 @@ export const TriggerFilterSchema = z
     guild: z.string().min(1).optional(),
     workspace: z.string().min(1).optional(),
     project: z.string().min(1).optional(),
+    /** A Linear team UUID; the routing resource of agent-session events. */
+    team: z.string().min(1).optional(),
+    /** How the Linear session was started. */
+    source: z.array(z.enum(LINEAR_SESSION_SOURCES)).min(1).optional(),
+    /** Accept sessions without a human creator (triage rules, automations). Default false. */
+    allow_automations: z.boolean().optional(),
     states: z.array(z.string().min(1)).min(1).optional(),
     exclude_labels: z.array(z.string().min(1)).min(1).optional(),
     assignees: z.array(z.string().min(1)).min(1).optional(),
@@ -105,6 +117,7 @@ export const TriggerRunSchema = z
     startup_timeout: z.string().min(1).optional(),
     env: z.record(z.string().min(1), z.string()).optional(),
     github: AuthoredGitHubAuthoritySchema.optional(),
+    linear: AuthoredLinearAuthoritySchema.optional(),
     output: z
       .object({ schema: z.record(z.string(), z.unknown()) })
       .strict()
@@ -172,6 +185,7 @@ export const TriggerDocumentSchema = z
         message: "at least one event is required",
       });
     }
+    refineLinearSessionRun(trigger, context);
     if ("choices" in trigger.run.agent && Object.keys(trigger.run.agent.choices).length === 0) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -182,3 +196,30 @@ export const TriggerDocumentSchema = z
   });
 
 export type TriggerDocument = z.infer<typeof TriggerDocumentSchema>;
+
+/** The Linear two-level continuation and the `linear` authority block need a session to act on. */
+function refineLinearSessionRun(
+  trigger: {
+    on: Record<string, unknown>;
+    run: { continuation: { mode: string }; linear?: unknown };
+  },
+  context: z.RefinementCtx,
+): void {
+  if (Object.keys(trigger.on).every(isLinearAgentSessionEvent)) return;
+  if (trigger.run.continuation.mode === "linear") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["run", "continuation", "mode"],
+      message:
+        'Continuation mode "linear" is only available for linear.agent_session_created and linear.agent_session_prompted',
+    });
+  }
+  if (trigger.run.linear !== undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["run", "linear"],
+      message:
+        "The linear block is only available for linear.agent_session_created and linear.agent_session_prompted",
+    });
+  }
+}

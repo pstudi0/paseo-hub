@@ -42,7 +42,13 @@ import { saveTrigger, triggerSnapshot, type TriggerSnapshot } from "./functions.
 import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshot, HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
-import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
+import {
+  EDITOR_EVENTS,
+  eventDefinition,
+  isLinearAgentSessionEvent,
+  parseEditorEvent,
+  type EditorEvent,
+} from "./configuration/events.js";
 import { selectedProviderModel } from "./provider-catalog.js";
 
 type BrowserTrigger = TriggerSnapshot["triggers"][number];
@@ -74,6 +80,37 @@ const EVENT_OPTIONS: readonly ComboboxOption[] = EDITOR_EVENTS.map((value) => {
     icon: <ProviderGlyph provider={provider} />,
   };
 });
+
+const CONTINUITY_OPTIONS: readonly SegmentedOption[] = [
+  {
+    value: "conversation",
+    label: "Same conversation",
+    hint: "Continue the same agent for this conversation. Events without a conversation start a new agent. Archived workspaces are restored.",
+  },
+  {
+    value: "key",
+    label: "Custom key",
+    hint: "Arrivals with the same key in this project share an agent. Agent and workspace settings must match.",
+  },
+  {
+    value: "new",
+    label: "New agent",
+    hint: "Create a separate agent for every request.",
+  },
+] as const;
+
+const LINEAR_SESSION_CONTINUITY: SegmentedOption = {
+  value: "linear",
+  label: "Linear session",
+  hint: "One workspace per issue, one agent per Linear session. Follow-ups reuse the running agent; a new delegation gets a new agent in the issue's workspace.",
+};
+
+/** The continuity modes an event can use: only Linear agent sessions have a two-level mode. */
+function continuityOptions(event: EditorEvent): readonly SegmentedOption[] {
+  return isLinearAgentSessionEvent(event)
+    ? [...CONTINUITY_OPTIONS, LINEAR_SESSION_CONTINUITY]
+    : CONTINUITY_OPTIONS;
+}
 
 const TRIGGERS_DESCRIPTION = "Launch agents on your compute when organization events arrive.";
 const TRIGGER_EDITOR_DESCRIPTION = "One event launches one agent on your compute.";
@@ -596,7 +633,8 @@ function TriggerForm({
   const githubEnabled = form.githubConnection !== "";
   const [githubExpanded, setGithubExpanded] = useState(githubEnabled);
   const [optionsExpanded, setOptionsExpanded] = useState(false);
-  const everyone = form.allowedUsers.trim() === "*";
+  const namedAudienceOnly = form.event === "linear.agent_session_created";
+  const everyone = !namedAudienceOnly && form.allowedUsers.trim() === "*";
   const update = <Key extends keyof TriggerFormValue>(key: Key, value: TriggerFormValue[Key]) =>
     onChange({ ...form, [key]: value });
   const text = (key: TriggerTextField) => (value: string) => update(key, value);
@@ -689,18 +727,25 @@ function TriggerForm({
         </Card>
 
         {eventDefinition(form.event).origin === "hub" ? null : (
-          <Card title={EDITOR_STEPS.access.title} description={EDITOR_STEPS.access.description}>
+          <Card
+            title={EDITOR_STEPS.access.title}
+            description={
+              namedAudienceOnly ? DELEGATION_ACCESS_DESCRIPTION : EDITOR_STEPS.access.description
+            }
+          >
             <div className="grid gap-4 sm:grid-cols-2">
-              <FormField id="trigger-audience" label="Audience">
-                {() => (
-                  <SegmentedControl
-                    label="Audience"
-                    value={everyone ? "everyone" : "specific"}
-                    options={AUDIENCE_OPTIONS}
-                    onChange={(value) => update("allowedUsers", value === "everyone" ? "*" : "")}
-                  />
-                )}
-              </FormField>
+              {namedAudienceOnly ? null : (
+                <FormField id="trigger-audience" label="Audience">
+                  {() => (
+                    <SegmentedControl
+                      label="Audience"
+                      value={everyone ? "everyone" : "specific"}
+                      options={AUDIENCE_OPTIONS}
+                      onChange={(value) => update("allowedUsers", value === "everyone" ? "*" : "")}
+                    />
+                  )}
+                </FormField>
+              )}
               {everyone ? null : (
                 <FormField
                   id="trigger-allowed-users"
@@ -841,23 +886,7 @@ function TriggerForm({
                 description="Agent continuity"
                 value={form.continuationMode}
                 onChange={text("continuationMode")}
-                options={[
-                  {
-                    value: "conversation",
-                    label: "Same conversation",
-                    hint: "Continue the same agent for this conversation. Events without a conversation start a new agent. Archived workspaces are restored.",
-                  },
-                  {
-                    value: "key",
-                    label: "Custom key",
-                    hint: "Arrivals with the same key in this project share an agent. Agent and workspace settings must match.",
-                  },
-                  {
-                    value: "new",
-                    label: "New agent",
-                    hint: "Create a separate agent for every request.",
-                  },
-                ]}
+                options={continuityOptions(form.event)}
               />
               {form.continuationMode === "key" ? (
                 <FormField
@@ -972,6 +1001,10 @@ function TriggerForm({
     </div>
   );
 }
+
+/** A delegation runs code on the daemon, so `linear.agent_session_created` never offers "everyone". */
+const DELEGATION_ACCESS_DESCRIPTION =
+  "The Linear users allowed to delegate work. A delegation runs code on your daemon, so it is never open to everyone.";
 
 const AUDIENCE_OPTIONS: readonly SegmentedOption[] = [
   { value: "everyone", label: "Everyone" },

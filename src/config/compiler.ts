@@ -1,9 +1,16 @@
-import { eventDefinition, isEditorEvent } from "../triggers/configuration/events.js";
+import {
+  eventDefinition,
+  isEditorEvent,
+  isLinearAgentSessionEvent,
+  LINEAR_SESSION_SOURCES,
+  type LinearSessionSource,
+} from "../triggers/configuration/events.js";
 import { ContinuationSchema } from "../triggers/continuation.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   expressionPaths,
+  expressionPathsInTemplate,
   parseExpression,
   validateExecutionTemplate,
   type Expression,
@@ -25,6 +32,13 @@ import {
   type CompiledGitHubAuthority,
 } from "./github-authority.js";
 import { validateConnectionTemplate } from "./connection-template.js";
+import {
+  AuthoredLinearAuthoritySchema,
+  CompiledLinearAuthoritySchema,
+  compileLinearAuthority,
+  validateLinearAuthority,
+  type CompiledLinearAuthority,
+} from "./linear-authority.js";
 
 const IDENTIFIER = /^[a-z][a-z0-9_-]*$/u;
 const EVENT_NAME = /^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$/u;
@@ -93,6 +107,12 @@ const AuthoredTriggerFilterSchema = z
     workspace: z.string().min(1).optional(),
     /** A Linear project UUID. It is deliberately a string so imported Linear IDs work verbatim. */
     project: z.string().min(1).optional(),
+    /** A Linear team UUID; the routing resource of agent-session events. */
+    team: z.string().min(1).optional(),
+    /** How the Linear session was started. */
+    source: z.array(z.enum(LINEAR_SESSION_SOURCES)).min(1).optional(),
+    /** Accept sessions without a human creator (triage rules, automations). Default false. */
+    allow_automations: z.boolean().optional(),
     /** Linear workflow-state IDs which are eligible for this trigger. */
     states: z.array(z.string().min(1)).min(1).optional(),
     /** Linear label IDs which make an issue ineligible. */
@@ -173,6 +193,7 @@ const StepSchema = z
     prompt: z.array(PromptBlockSchema).min(1),
     env: z.record(z.string().min(1), z.string()).optional(),
     github: AuthoredGitHubAuthoritySchema.optional(),
+    linear: AuthoredLinearAuthoritySchema.optional(),
     if: z.string().min(1).optional(),
     output: z.object({ schema: JsonSchemaSchema }).strict().optional(),
     allow_outputs: z.array(AllowOutputSchema).optional(),
@@ -249,6 +270,7 @@ export interface CompiledStep {
   prompt: readonly CompiledPromptBlock[];
   env?: Readonly<Record<string, string>> | undefined;
   github?: CompiledGitHubAuthority | undefined;
+  linear?: CompiledLinearAuthority | undefined;
   condition?: Expression | undefined;
   output?: { schema: JsonValue } | undefined;
   allowOutputs: readonly { type: string; max?: number | undefined; required: boolean }[];
@@ -260,9 +282,10 @@ export type CompiledSteps = readonly CompiledStep[];
 export type CompiledTriggerFilter = Readonly<
   Omit<
     AuthoredTriggerFilter,
-    "channels" | "from_users" | "states" | "labels" | "exclude_labels" | "assignees"
+    "channels" | "from_users" | "states" | "labels" | "exclude_labels" | "assignees" | "source"
   > & {
     channels?: readonly string[] | undefined;
+    source?: readonly LinearSessionSource[] | undefined;
     from_users?: readonly string[] | undefined;
     states?: readonly string[] | undefined;
     labels?: readonly string[] | undefined;
@@ -398,6 +421,7 @@ const CompiledStepSchema: z.ZodType<CompiledStep> = z
     prompt: z.array(CompiledPromptBlockSchema).min(1),
     env: z.record(z.string(), z.string()).optional(),
     github: CompiledGitHubAuthoritySchema.optional(),
+    linear: CompiledLinearAuthoritySchema.optional(),
     condition: z.custom<Expression>(isExpression).optional(),
     output: z.object({ schema: CompiledJsonSchemaSchema }).strict().optional(),
     allowOutputs: z.array(
@@ -444,7 +468,7 @@ export function compileHubConfig(
   const environments = new Map(
     authored.environments.map((environment) => [environment.name, environment]),
   );
-  validateEnvironmentTemplates(authored.environments);
+  validateEnvironmentTemplates(authored.environments, authored.triggers);
   const triggers = authored.triggers.map((trigger) =>
     compileTrigger(
       trigger,
@@ -520,6 +544,7 @@ function compileTrigger(
   });
   const inputs = compileAt([...triggerPath, "inputs"], () => compileInputs(trigger));
   compileAt([...triggerPath, "filters"], () => validateInputFilters(trigger, inputs));
+  compileAt([...triggerPath, "filters"], () => validateLinearSessionFilters(trigger));
   compileAt([...triggerPath, "steps"], () =>
     validateEnvironmentInputChoices(trigger, inputs, environmentNames, environments),
   );
@@ -586,6 +611,15 @@ function compileStep(
       ? undefined
       : compileGitHubAuthority(step.github, `trigger ${trigger.name} step ${step.id} github`);
   validateStepEnvironmentContract(trigger.name, trigger.on, step.id, env, github);
+  const linear =
+    step.linear === undefined
+      ? undefined
+      : compileAt([...stepPath, "linear"], () =>
+          compileLinearAuthority(step.linear!, `trigger ${trigger.name} step ${step.id} linear`),
+        );
+  compileAt([...stepPath, "linear"], () =>
+    validateStepLinearContract(trigger.name, trigger.on, step.id, linear),
+  );
   const agent = compileAt([...stepPath, "agent"], () =>
     compileAgentSelection(trigger.name, step.id, step.agent, namedAgents),
   );
@@ -608,6 +642,7 @@ function compileStep(
     prompt: compilePromptBlocks(trigger.name, step.id, step.prompt, resolvedPromptPartials),
     ...(env === undefined ? {} : { env }),
     ...(github === undefined ? {} : { github }),
+    ...(linear === undefined ? {} : { linear }),
     ...(condition === undefined ? {} : { condition }),
     ...(outputDeclaration === undefined ? {} : { output: outputDeclaration }),
     allowOutputs: (step.allow_outputs ?? []).map((allowOutput) => ({
@@ -958,6 +993,7 @@ function validateExpressionContract(
       const value = trigger.values[reference.name];
       return value === undefined ? undefined : finiteExpressionValues(value, ordinal);
     }
+    if (reference.namespace === "linear") return undefined;
     const referencedOrdinal = stepOrdinals.get(reference.stepId);
     if (referencedOrdinal === undefined || referencedOrdinal >= ordinal) return undefined;
     const output = trigger.steps[referencedOrdinal]?.output;
@@ -1044,6 +1080,9 @@ function validateExpressionContract(
         throw new Error(`${path} references undeclared value ${reference.name}`);
       return;
     }
+    if (reference.namespace === "linear") {
+      throw new Error(`${path} uses linear.issue outside environment worktree.newBranch`);
+    }
     const referencedOrdinal = stepOrdinals.get(reference.stepId);
     if (referencedOrdinal === undefined)
       throw new Error(`${path} references unknown step ${reference.stepId}`);
@@ -1083,6 +1122,7 @@ function validateExpressionContract(
       const value = trigger.values[reference.name];
       return value !== undefined && isFiniteAuthorityExpression(value);
     }
+    if (reference.namespace === "linear") return false;
     const referencedOrdinal = stepOrdinals.get(reference.stepId);
     const step = referencedOrdinal === undefined ? undefined : trigger.steps[referencedOrdinal];
     return step?.output !== undefined && hasFiniteSchemaChoices(step.output.schema, reference.path);
@@ -1147,7 +1187,7 @@ function matchesInputType(value: JsonPrimitive | undefined, type: AuthoredInput[
 }
 
 function validateCompiledContract(config: CompiledHubConfig): void {
-  validateEnvironmentTemplates(config.environments);
+  validateEnvironmentTemplates(config.environments, config.triggers);
   const environmentIds = new Set<string>();
   const environments = new Map<string, CompiledEnvironment>();
   for (const environment of config.environments) {
@@ -1175,6 +1215,8 @@ function validateCompiledContract(config: CompiledHubConfig): void {
       }
       validateCompiledStepEnvironment(step, trigger.inputs, environments);
       validateStepEnvironmentContract(trigger.name, trigger.on, step.id, step.env, step.github);
+      validateStepLinearContract(trigger.name, trigger.on, step.id, step.linear);
+      validateStepContinuationContract(trigger.name, trigger.on, step.id, step.continuation);
       if (step.idleTimeoutMs > step.maxRuntimeMs) {
         throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
       }
@@ -1192,19 +1234,110 @@ function validateCompiledContract(config: CompiledHubConfig): void {
         throw new Error(`value ${name} contains an invalid expression`);
     }
     validateExpressionContract(trigger.name, trigger, environments);
+    validateLinearSessionFilters(trigger);
     validateTriggerLaunchSecurity(trigger);
   }
 }
 
+/**
+ * `worktree.newBranch` may read `linear.issue.identifier` only when every step targeting the
+ * environment belongs to a Linear agent-session trigger: any other trigger would launch without
+ * an issue to name the branch after. A step whose environment is an expression may resolve to
+ * any environment, so it counts as targeting all of them.
+ */
 function validateEnvironmentTemplates(
   environments: readonly (AuthoredEnvironment | CompiledEnvironment)[],
+  triggers: readonly (AuthoredTrigger | CompiledTrigger)[],
 ): void {
   for (const environment of environments) {
     if (environment.kind !== "daemon" || environment.worktree?.mode !== "branch-off") continue;
     const newBranch = environment.worktree.newBranch;
+    const targetingTriggers = triggers.filter((trigger) =>
+      trigger.steps.some(
+        (step) =>
+          step.environment === environment.name || step.environment.includes(EXPRESSION_START),
+      ),
+    );
+    const allowLinearIssue = targetingTriggers.every((trigger) =>
+      isLinearAgentSessionEvent(trigger.on),
+    );
     compileAt(["environments", environment.name, "worktree", "newBranch"], () => {
-      validateExecutionTemplate(newBranch);
+      if (
+        !allowLinearIssue &&
+        expressionPathsInTemplate(newBranch).some((path) => path.namespace === "linear")
+      ) {
+        throw new Error(
+          `environments.${environment.name}.worktree.newBranch uses linear.issue.identifier but a non-Linear trigger targets this environment`,
+        );
+      }
+      validateExecutionTemplate(newBranch, { allowLinearIssue });
     });
+  }
+}
+
+/** The `linear` block only makes sense where there is a Linear agent session to act for. */
+function validateStepLinearContract(
+  triggerName: string,
+  triggerEvent: string,
+  stepId: string,
+  linear: CompiledLinearAuthority | undefined,
+): void {
+  if (linear === undefined) return;
+  validateLinearAuthority(linear, `trigger ${triggerName} step ${stepId} linear`);
+  if (!isLinearAgentSessionEvent(triggerEvent)) {
+    throw new Error(
+      `trigger ${triggerName} step ${stepId} linear is only available for linear.agent_session_created and linear.agent_session_prompted`,
+    );
+  }
+}
+
+function validateStepContinuationContract(
+  triggerName: string,
+  triggerEvent: string,
+  stepId: string,
+  continuation: CompiledStep["continuation"],
+): void {
+  if (continuation?.mode !== "linear" || isLinearAgentSessionEvent(triggerEvent)) return;
+  throw new Error(
+    `trigger ${triggerName} step ${stepId}: Continuation mode "linear" is only available for linear.agent_session_created and linear.agent_session_prompted`,
+  );
+}
+
+const ISSUE_ONLY_FILTER_KEYS = [
+  "project",
+  "states",
+  "assignees",
+  "labels",
+  "exclude_labels",
+  "pattern",
+  "contains",
+] as const;
+const SESSION_ONLY_FILTER_KEYS = ["team", "source", "allow_automations"] as const;
+
+/**
+ * Agent-session payloads carry a team and a session, not a project, state, or labels; issue and
+ * comment payloads carry the reverse. A filter that can never match is refused rather than
+ * silently ignored.
+ */
+function validateLinearSessionFilters(trigger: AuthoredTrigger | CompiledTrigger): void {
+  const filters = trigger.filters;
+  if (filters === undefined) return;
+  if (isLinearAgentSessionEvent(trigger.on)) {
+    for (const key of ISSUE_ONLY_FILTER_KEYS) {
+      if (filters[key] !== undefined) {
+        throw new Error(
+          `trigger ${trigger.name} filters.${key} is not available for ${trigger.on}; the session payload carries no such field`,
+        );
+      }
+    }
+    return;
+  }
+  for (const key of SESSION_ONLY_FILTER_KEYS) {
+    if (filters[key] !== undefined) {
+      throw new Error(
+        `trigger ${trigger.name} filters.${key} is only available for linear.agent_session_created and linear.agent_session_prompted`,
+      );
+    }
   }
 }
 
@@ -1313,6 +1446,14 @@ function isExpressionPath(value: unknown): boolean {
       value["path"].every((part) => typeof part === "string")
     );
   }
+  if (value["namespace"] === "linear") {
+    return (
+      Array.isArray(value["path"]) &&
+      value["path"].length === 2 &&
+      value["path"][0] === "issue" &&
+      value["path"][1] === "identifier"
+    );
+  }
   return (
     value["namespace"] === "paseo" &&
     (value["path"] === "prompt" ||
@@ -1357,9 +1498,38 @@ function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
     }
     return;
   }
+  if (isLinearAgentSessionEvent(trigger.on)) {
+    validateLinearSessionLaunchSecurity(trigger);
+    return;
+  }
   if ((trigger.filters?.from_users?.length ?? 0) === 0) {
     throw new Error(
       `trigger ${trigger.name} requires a non-empty filters.from_users allowlist for externally sourced events`,
+    );
+  }
+}
+
+/**
+ * A session trigger without a team would serve every team the app can see, and a delegation
+ * runs code on the operator's daemon: `created` needs named humans, `prompted` may accept anyone
+ * because it only continues a session those humans already opened.
+ */
+function validateLinearSessionLaunchSecurity(trigger: CompiledTrigger): void {
+  if (trigger.filters?.team === undefined) {
+    throw new Error(`trigger ${trigger.name} requires filters.team for ${trigger.on}`);
+  }
+  const fromUsers = trigger.filters.from_users ?? [];
+  if (trigger.on === "linear.agent_session_created") {
+    if (fromUsers.length === 0 || fromUsers.includes("*")) {
+      throw new Error(
+        `trigger ${trigger.name} requires explicit Linear user IDs in filters.from_users for linear.agent_session_created; "*" is not allowed because a delegation runs code on your daemon`,
+      );
+    }
+    return;
+  }
+  if (fromUsers.length === 0) {
+    throw new Error(
+      `trigger ${trigger.name} requires a non-empty filters.from_users allowlist for ${trigger.on}`,
     );
   }
 }

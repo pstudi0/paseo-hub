@@ -1,5 +1,5 @@
 /** The YAML filter keys the form knows how to qualify. */
-export type QualifierKey = "label";
+export type QualifierKey = "label" | "team";
 
 /** Draft values for the qualifiers declared by the selected event. */
 export type QualifierValues = Partial<Record<QualifierKey, string>>;
@@ -25,6 +25,18 @@ const ADDED_LABEL: QualifierDefinition = {
   label: "Added label",
   description:
     "Match the label added by this event, not labels already on the issue or pull request.",
+  required: true,
+};
+
+/** How a Linear agent session was started; the vocabulary of the `source` filter. */
+export const LINEAR_SESSION_SOURCES = ["delegation", "mention", "proactive"] as const;
+export type LinearSessionSource = (typeof LINEAR_SESSION_SOURCES)[number];
+
+const LINEAR_TEAM: QualifierDefinition = {
+  key: "team",
+  kind: "string",
+  label: "Linear team",
+  description: "The Linear team UUID whose agent sessions this trigger serves.",
   required: true,
 };
 
@@ -61,6 +73,8 @@ const EVENTS = {
   "linear.issue_entered_scope": event("linear", "Linear issue entered scope"),
   "linear.issue_assigned": event("linear", "Linear issue assigned"),
   "linear.comment_created": event("linear", "Linear comment created"),
+  "linear.agent_session_created": event("linear", "Linear agent session created", [LINEAR_TEAM]),
+  "linear.agent_session_prompted": event("linear", "Linear agent session prompted", [LINEAR_TEAM]),
   "schedule.tick": event("schedule", "Schedule"),
   "manual.run": event("manual", "Manual run"),
 };
@@ -78,4 +92,16 @@ export function parseEditorEvent(value: string): EditorEvent {
 
 export function eventDefinition(eventId: EditorEvent): EventDefinition {
   return EVENTS[eventId];
+}
+
+/** The two Linear agent-session events: the only events that carry a session and a team. */
+export const LINEAR_AGENT_SESSION_EVENTS = [
+  "linear.agent_session_created",
+  "linear.agent_session_prompted",
+] as const satisfies readonly EditorEvent[];
+
+export type LinearAgentSessionEvent = (typeof LINEAR_AGENT_SESSION_EVENTS)[number];
+
+export function isLinearAgentSessionEvent(value: string): value is LinearAgentSessionEvent {
+  return (LINEAR_AGENT_SESSION_EVENTS as readonly string[]).includes(value);
 }

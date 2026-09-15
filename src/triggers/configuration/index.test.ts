@@ -9,6 +9,21 @@ import {
   TriggerDocumentError,
 } from "./index.js";
 
+function reportsIssue(
+  error: unknown,
+  path: string,
+  message: RegExp | string,
+): error is TriggerDocumentError {
+  return (
+    error instanceof TriggerDocumentError &&
+    error.issues.some(
+      (issue) =>
+        issue.path.join(".") === path &&
+        (typeof message === "string" ? issue.message === message : message.test(issue.message)),
+    )
+  );
+}
+
 function reportsMissingEvent(error: unknown): boolean {
   return (
     error instanceof TriggerDocumentError &&
@@ -207,4 +222,175 @@ it("applies the continuation default when reading old trigger revisions without 
     }),
   });
   assert.deepEqual(migratedLegacy, legacy);
+});
+
+describe("Linear agent session documents", () => {
+  const TEAM = "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01";
+  /** The design document's one-trigger-per-project example, with the names Hub settled on. */
+  const linearAgent = `
+name: linear-agent
+enabled: true
+on:
+  linear.agent_session_created:
+    connection: p-studio-linear
+    filters:
+      team: "${TEAM}"
+      from_users: ["user-anthony", "user-colleague"]
+      source: [delegation, mention]
+  linear.agent_session_prompted:
+    connection: p-studio-linear
+    filters:
+      team: "${TEAM}"
+      from_users: ["*"]
+run:
+  target:
+    daemon: cs8-senspace-vps
+    cwd: /srv/senspace
+    worktree:
+      mode: branch-off
+      newBranch: "linear/\${{ linear.issue.identifier }}"
+      base: origin/main
+  agent:
+    provider: claude
+    model: claude-opus-5
+    mode: bypassPermissions
+  continuation:
+    mode: linear
+  github:
+    connection: p-studio-github
+    repositories: [p-studio/senspace]
+    permissions: { contents: write, pull_requests: write }
+  linear:
+    on_start: started
+    on_pull_request: "In Review"
+    mirror: { actions: true, thoughts: summary, plan: true }
+  startup_timeout: 5m
+  max_runtime: 3h
+  idle_timeout: 20m
+  auto_archive: false
+  prompt: |
+    Work in this worktree, open a pull request, then call hub.linear_response.
+    \${{ paseo.context }}
+    <user-prompt>
+    \${{ paseo.prompt }}
+    </user-prompt>
+  outputs:
+    linear.response: { max: 1, required: true }
+    linear.ask: { max: 5 }
+    linear.plan: { max: 50 }
+    linear.link: { max: 5 }
+`;
+
+  it("compiles the design document's trigger into two session events sharing one issue workspace", () => {
+    const compiled = compileTriggerDocument(linearAgent);
+    assert.deepEqual(
+      compiled.events.map(({ on }) => on),
+      ["linear.agent_session_created", "linear.agent_session_prompted"],
+    );
+    assert.equal(compiled.environment.kind, "daemon");
+    assert.deepEqual(compiled.environment.worktree, {
+      mode: "branch-off",
+      newBranch: "linear/${{ linear.issue.identifier }}",
+      base: "origin/main",
+    });
+    assert.deepEqual(compiled.events[0]?.filters, {
+      team: TEAM,
+      from_users: ["user-anthony", "user-colleague"],
+      source: ["delegation", "mention"],
+      connection: "p-studio-linear",
+    });
+    assert.deepEqual(compiled.events[1]?.filters, {
+      team: TEAM,
+      from_users: ["*"],
+      connection: "p-studio-linear",
+    });
+    for (const event of compiled.events) {
+      assert.deepEqual(event.steps[0]?.continuation, { mode: "linear" });
+      assert.deepEqual(event.steps[0]?.linear, {
+        onStart: { kind: "type", type: "started" },
+        onPullRequest: { kind: "name", name: "In Review" },
+        delegate: false,
+        mirror: { actions: true, thoughts: "summary", plan: true, permissions: true },
+      });
+      assert.equal(event.steps[0]?.autoArchive, false);
+      assert.deepEqual(event.steps[0]?.allowOutputs.map(({ type }) => type).slice(0, 4), [
+        "linear.response",
+        "linear.ask",
+        "linear.plan",
+        "linear.link",
+      ]);
+    }
+    assert.deepEqual(
+      parseTriggerDocument(serializeTriggerDocument(compiled.authored)),
+      compiled.authored,
+    );
+  });
+
+  it("refuses the linear continuation and the linear block beside a non-session event", () => {
+    const withSlack = linearAgent.replace(
+      '  linear.agent_session_prompted:\n    connection: p-studio-linear\n    filters:\n      team: "' +
+        TEAM +
+        '"\n      from_users: ["*"]',
+      '  slack.mention:\n    connection: acme-slack\n    filters: { from_users: ["*"] }',
+    );
+    assert.throws(
+      () => parseTriggerDocument(withSlack),
+      (error) =>
+        reportsIssue(
+          error,
+          "run.continuation.mode",
+          /Continuation mode "linear" is only available for linear\.agent_session_created and linear\.agent_session_prompted/u,
+        ) && reportsIssue(error, "run.linear", /only available for linear\.agent_session/u),
+    );
+  });
+
+  it("requires the Linear team at the document boundary and refuses issue-only filters at compile time", () => {
+    assert.throws(
+      () =>
+        parseTriggerDocument(
+          linearAgent.replace(
+            `      team: "${TEAM}"\n      from_users: ["*"]`,
+            '      from_users: ["*"]',
+          ),
+        ),
+      (error) =>
+        reportsIssue(
+          error,
+          "on.linear.agent_session_prompted.filters.team",
+          "Linear team is required.",
+        ),
+    );
+    assert.throws(
+      () =>
+        compileTriggerDocument(
+          linearAgent.replace("      source: [delegation, mention]", "      states: [ready]"),
+        ),
+      /filters\.states is not available for linear\.agent_session_created/u,
+    );
+    assert.throws(
+      () =>
+        parseTriggerDocument(
+          linearAgent.replace("source: [delegation, mention]", "source: [webhook]"),
+        ),
+      TriggerDocumentError,
+    );
+  });
+
+  it("keeps session filters out of issue and comment triggers", () => {
+    assert.throws(
+      () =>
+        compileTriggerDocument(`
+name: assigned
+on:
+  linear.issue_assigned:
+    connection: acme-linear
+    filters: { from_users: ["*"], source: [delegation] }
+run:
+  target: { daemon: devbox, cwd: /workspace }
+  agent: { provider: codex, mode: full-access }
+  prompt: Handle it
+`),
+      /filters\.source is only available for linear\.agent_session_created and linear\.agent_session_prompted/u,
+    );
+  });
 });

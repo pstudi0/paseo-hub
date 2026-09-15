@@ -40,6 +40,9 @@ export type {
   CompiledTriggerConfig,
   CompiledGitHubAuthority,
   GitHubPermissionLevel,
+  AuthoredLinearAuthority,
+  CompiledLinearAuthority,
+  LinearStateSelector,
 } from "./schema.js";
 
 export interface RuntimeConfig {
