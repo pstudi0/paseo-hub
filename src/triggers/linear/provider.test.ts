@@ -569,8 +569,6 @@ describe("Linear agent session trigger provider", () => {
             body: delivery.activity!.body,
             createdAt: triggerAt,
           }),
-          activity("mirror-thought", "thought", { createdAt: "2026-09-15T10:05:05.000Z" }),
-          activity("mirror-action", "action", { createdAt: "2026-09-15T10:05:06.000Z" }),
           ...earlier.toReversed(),
         ],
       },
@@ -885,7 +883,7 @@ function activity(
     createdAt: input.createdAt,
     signal: null,
     user: { id: `user-${id}` },
-    content: type === "thought" || type === "action" ? { type } : { type, body: input.body ?? "" },
+    content: { type, body: input.body ?? "" },
   };
 }
 

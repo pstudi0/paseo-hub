@@ -441,6 +441,7 @@ async function sessionThreadContext(
     linearOrganizationId,
     agentSessionId: locator.session.id,
     beforeCreatedAt: locator.before.created_at,
+    excludeActivityId: locator.before.activity_id,
   });
   // Thoughts and actions are the agent's own mirror, not the conversation; the trigger prompt is
   // already `paseo.prompt` verbatim.
