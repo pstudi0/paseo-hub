@@ -1,8 +1,22 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { compileHubConfig } from "../../config/index.js";
-import type { NormalizedLinearCommentEvent, NormalizedLinearIssueEvent } from "./events.js";
-import { matchLinearTriggers, readLinearCommentInvocationParserMessage } from "./match.js";
+import {
+  LINEAR_FIXTURE,
+  readLinearFixture,
+  type LinearFixtureName,
+} from "../../test-utils/linear-fixtures.js";
+import {
+  normalizeLinearEvent,
+  type NormalizedLinearAgentSessionEvent,
+  type NormalizedLinearCommentEvent,
+  type NormalizedLinearIssueEvent,
+} from "./events.js";
+import {
+  matchesSessionScope,
+  matchLinearTriggers,
+  readLinearInvocationParserMessage,
+} from "./match.js";
 
 describe("Linear trigger matching", () => {
   it("starts a project scout exactly when an issue enters its eligible scope", () => {
@@ -97,6 +111,217 @@ describe("Linear trigger matching", () => {
   });
 });
 
+describe("Linear agent session matching", () => {
+  it("serves created and prompted sessions from their own events only", () => {
+    const config = sessionConfiguration();
+
+    assert.deepEqual(names(matchLinearTriggers(config, session("linear-agent-session-created"))), [
+      "delegated",
+    ]);
+    assert.deepEqual(names(matchLinearTriggers(config, session("linear-agent-session-prompted"))), [
+      "followed-up",
+    ]);
+    assert.deepEqual(names(matchLinearTriggers(config, session("linear-agent-session-stop"))), [
+      "followed-up",
+    ]);
+  });
+
+  it("never matches session events on issue or comment triggers, nor the reverse", () => {
+    assert.equal(
+      matchLinearTriggers(configuration(), session("linear-agent-session-created")).length,
+      0,
+    );
+    assert.equal(
+      matchLinearTriggers(configuration(), session("linear-agent-session-prompted")).length,
+      0,
+    );
+    const sessionOnly = sessionConfiguration();
+    assert.equal(matchLinearTriggers(sessionOnly, issue({ action: "create" })).length, 0);
+    assert.equal(matchLinearTriggers(sessionOnly, commentEvent()).length, 0);
+  });
+
+  it("keeps sessions on the trigger's team", () => {
+    const otherTeam = sessionConfiguration({ team: "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0dff" });
+
+    assert.equal(matchLinearTriggers(otherTeam, session("linear-agent-session-created")).length, 0);
+    assert.equal(
+      matchLinearTriggers(otherTeam, session("linear-agent-session-prompted")).length,
+      0,
+    );
+  });
+
+  it("ignores a session without an issue", () => {
+    const event = session("linear-agent-session-created");
+    const withoutIssue = { ...event, session: { ...event.session, issue: null } };
+
+    assert.equal(matchLinearTriggers(sessionConfiguration(), withoutIssue).length, 0);
+  });
+
+  it.each([
+    { source: ["delegation"], fixture: "linear-agent-session-created", matches: true },
+    { source: ["delegation"], fixture: "linear-agent-session-created-mention", matches: false },
+    { source: ["mention"], fixture: "linear-agent-session-created-mention", matches: true },
+    { source: ["mention"], fixture: "linear-agent-session-created", matches: false },
+    { source: ["automation"], fixture: "linear-agent-session-created-automation", matches: true },
+    { source: ["automation"], fixture: "linear-agent-session-created", matches: false },
+    {
+      source: ["delegation", "mention"],
+      fixture: "linear-agent-session-created-mention",
+      matches: true,
+    },
+  ] as const)("filters by source $source for $fixture", ({ source, fixture, matches }) => {
+    const config = sessionConfiguration({ source: [...source], allow_automations: true });
+
+    assert.equal(matchLinearTriggers(config, session(fixture)).length, matches ? 1 : 0);
+  });
+
+  it("accepts a session without a responsible human only when automations are allowed", () => {
+    const automation = session("linear-agent-session-created-automation");
+
+    assert.equal(matchLinearTriggers(sessionConfiguration(), automation).length, 0);
+    assert.deepEqual(
+      names(matchLinearTriggers(sessionConfiguration({ allow_automations: true }), automation)),
+      ["delegated"],
+    );
+    // `from_users` is not consulted for an automation: matching does not need the allowlist the
+    // compiler still requires on `created`.
+    assert.equal(
+      matchesSessionScope(automation, { team: LINEAR_FIXTURE.teamId, allow_automations: true }),
+      true,
+    );
+    assert.equal(
+      matchesSessionScope(automation, {
+        team: LINEAR_FIXTURE.teamId,
+        from_users: [LINEAR_FIXTURE.humanId],
+      }),
+      false,
+    );
+  });
+
+  it("allowlists the creator of a new session and the author of a follow-up", () => {
+    const stranger = { id: LINEAR_FIXTURE.otherHumanId, name: "Camille" };
+    const created = session("linear-agent-session-created");
+    const prompted = session("linear-agent-session-prompted");
+    const config = sessionConfiguration({ from_users: [LINEAR_FIXTURE.humanId] });
+
+    assert.deepEqual(names(matchLinearTriggers(config, created)), ["delegated"]);
+    assert.equal(
+      matchLinearTriggers(config, {
+        ...created,
+        session: { ...created.session, creator: stranger },
+      }).length,
+      0,
+    );
+    assert.deepEqual(names(matchLinearTriggers(config, prompted)), ["followed-up"]);
+    assert.equal(
+      matchLinearTriggers(config, {
+        ...prompted,
+        activity: { ...prompted.activity!, user: stranger },
+      }).length,
+      0,
+    );
+    assert.equal(
+      matchLinearTriggers(config, {
+        ...created,
+        session: { ...created.session, creator: null },
+      }).length,
+      0,
+    );
+  });
+
+  it("honors the wildcard for follow-ups only", () => {
+    const filter = { team: LINEAR_FIXTURE.teamId, from_users: ["*"] };
+
+    assert.equal(matchesSessionScope(session("linear-agent-session-prompted"), filter), true);
+    assert.equal(matchesSessionScope(session("linear-agent-session-created"), filter), false);
+    assert.equal(
+      matchesSessionScope(session("linear-agent-session-created"), {
+        ...filter,
+        from_users: ["*", LINEAR_FIXTURE.humanId],
+      }),
+      true,
+    );
+    assert.equal(
+      matchesSessionScope(session("linear-agent-session-prompted"), { ...filter, from_users: [] }),
+      false,
+    );
+    assert.equal(matchesSessionScope(session("linear-agent-session-prompted"), undefined), false);
+  });
+
+  it("keeps session triggers isolated to their configured Linear connection", () => {
+    const connectionId = "11111111-1111-4111-8111-111111111111";
+    const config = sessionConfiguration();
+    const scoped = Object.assign({}, config, {
+      triggers: config.triggers.map((trigger) =>
+        Object.assign({}, trigger, {
+          filters: Object.assign({}, trigger.filters, { connectionId }),
+        }),
+      ),
+    });
+
+    for (const [fixture, expected] of [
+      ["linear-agent-session-created", "delegated"],
+      ["linear-agent-session-prompted", "followed-up"],
+    ] as const) {
+      assert.deepEqual(names(matchLinearTriggers(scoped, session(fixture), connectionId)), [
+        expected,
+      ]);
+      assert.equal(
+        matchLinearTriggers(scoped, session(fixture), "22222222-2222-4222-8222-222222222222")
+          .length,
+        0,
+      );
+      assert.equal(matchLinearTriggers(scoped, session(fixture)).length, 0);
+    }
+  });
+
+  it("hands the parser the follow-up body, the mention comment, or nothing", () => {
+    assert.equal(
+      readLinearInvocationParserMessage(session("linear-agent-session-prompted"), undefined),
+      "Also add a regression test, priority=high",
+    );
+    assert.equal(
+      readLinearInvocationParserMessage(session("linear-agent-session-created-mention"), undefined),
+      "@Paseo please take this one, priority=high",
+    );
+    assert.equal(
+      readLinearInvocationParserMessage(session("linear-agent-session-created"), undefined),
+      "",
+    );
+    assert.equal(
+      readLinearInvocationParserMessage(
+        session("linear-agent-session-created-automation"),
+        undefined,
+      ),
+      "",
+    );
+    assert.equal(
+      readLinearInvocationParserMessage(session("linear-agent-session-prompted"), {
+        pattern: "Also",
+      }),
+      "add a regression test, priority=high",
+    );
+  });
+
+  it("never parses a root comment Linear wrote as the app user, only a human's", () => {
+    const created = session("linear-agent-session-created");
+    const rootComment = (userId: string | null) => ({
+      ...created,
+      session: { ...created.session, comment: { id: "root", body: "priority=high", userId } },
+    });
+
+    assert.equal(
+      readLinearInvocationParserMessage(rootComment(LINEAR_FIXTURE.appUserId), undefined),
+      "",
+    );
+    assert.equal(readLinearInvocationParserMessage(rootComment(null), undefined), "");
+    assert.equal(
+      readLinearInvocationParserMessage(rootComment(LINEAR_FIXTURE.humanId), undefined),
+      "priority=high",
+    );
+  });
+});
+
 describe("Linear comment invocation parser handoff", () => {
   it.each([
     {
@@ -154,7 +379,7 @@ describe("Linear comment invocation parser handoff", () => {
       expected: "repo=hub priority=high investigate",
     },
   ])("$name", ({ filters, body, expected }) => {
-    assert.equal(readLinearCommentInvocationParserMessage(commentEvent(body), filters), expected);
+    assert.equal(readLinearInvocationParserMessage(commentEvent(body), filters), expected);
   });
 });
 
@@ -197,6 +422,61 @@ function configuration() {
       },
     ],
   });
+}
+
+function sessionConfiguration(
+  filters: {
+    team?: string;
+    from_users?: string[];
+    source?: string[];
+    allow_automations?: boolean;
+  } = {},
+) {
+  const base = {
+    id: "work",
+    environment: "runner",
+    max_runtime: "1h",
+    idle_timeout: "5m",
+    agent: { provider: "codex" },
+    prompt: [{ text: "Work from ${{ paseo.context }}" }],
+  };
+  const shared = {
+    team: filters.team ?? LINEAR_FIXTURE.teamId,
+    ...(filters.source === undefined ? {} : { source: filters.source }),
+    ...(filters.allow_automations === undefined
+      ? {}
+      : { allow_automations: filters.allow_automations }),
+  };
+  const from_users = filters.from_users ?? [LINEAR_FIXTURE.humanId];
+  return compileHubConfig({
+    environments: [{ name: "runner", kind: "daemon", daemon: "runner", cwd: "/repo" }],
+    triggers: [
+      {
+        name: "delegated",
+        on: "linear.agent_session_created",
+        max_runtime: "2h",
+        filters: { ...shared, from_users },
+        steps: [base],
+      },
+      {
+        name: "followed-up",
+        on: "linear.agent_session_prompted",
+        max_runtime: "2h",
+        filters: { ...shared, from_users },
+        steps: [base],
+      },
+    ],
+  });
+}
+
+function session(fixture: LinearFixtureName): NormalizedLinearAgentSessionEvent {
+  const event = normalizeLinearEvent(readLinearFixture(fixture));
+  if (event?.type !== "agent_session") throw new Error(`expected a session fixture: ${fixture}`);
+  return event;
+}
+
+function names(matches: ReturnType<typeof matchLinearTriggers>): string[] {
+  return matches.map((match) => match.trigger.name);
 }
 
 function issue(

@@ -2,11 +2,14 @@ import type {
   CompiledTriggerConfig as CompiledTrigger,
   TriggerFilter,
 } from "../../config/index.js";
-import type {
-  NormalizedLinearCommentEvent,
-  NormalizedLinearEvent,
-  NormalizedLinearIssue,
-  NormalizedLinearIssueEvent,
+import {
+  humanRootComment,
+  linearSessionSource,
+  type NormalizedLinearAgentSessionEvent,
+  type NormalizedLinearCommentEvent,
+  type NormalizedLinearEvent,
+  type NormalizedLinearIssue,
+  type NormalizedLinearIssueEvent,
 } from "./events.js";
 
 type MatchedTriggerDefinition = Pick<CompiledTrigger, "name" | "on" | "filters">;
@@ -17,15 +20,18 @@ export interface MatchedLinearTrigger {
 }
 
 /**
- * Preserve a comment as the prompt while handing its input parser the text after its command
- * marker. A command `pattern` is consumed only at a boundary; a `contains` marker is then found
- * in the remaining tail. Input-shaped markers such as `repo=hub` remain in the parser text.
+ * Preserve the human message as the prompt while handing its input parser the text after its
+ * command marker. A command `pattern` is consumed only at a boundary; a `contains` marker is
+ * then found in the remaining tail. Input-shaped markers such as `repo=hub` remain in the parser
+ * text. A session prompt parses like a comment; a created session parses its mention comment
+ * when a human wrote one and nothing otherwise: neither `promptContext` nor Linear's artificial
+ * root comment is human input.
  */
-export function readLinearCommentInvocationParserMessage(
-  event: NormalizedLinearCommentEvent,
+export function readLinearInvocationParserMessage(
+  event: NormalizedLinearCommentEvent | NormalizedLinearAgentSessionEvent,
   filter: TriggerFilter | undefined,
 ): string {
-  const body = event.comment.body;
+  const body = invocationBody(event);
   const pattern = readCommentTextFilter(filter, "pattern");
   const contains = readCommentTextFilter(filter, "contains");
 
@@ -101,7 +107,21 @@ export function matchesIssueScope(
   return true;
 }
 
+function invocationBody(
+  event: NormalizedLinearCommentEvent | NormalizedLinearAgentSessionEvent,
+): string {
+  if (event.type === "comment") return event.comment.body;
+  if (event.activity !== null) return event.activity.body;
+  return humanRootComment(event)?.body ?? "";
+}
+
 function matchesLinearEvent(eventName: string, event: NormalizedLinearEvent): boolean {
+  if (eventName === "linear.agent_session_created") {
+    return event.type === "agent_session" && event.action === "created";
+  }
+  if (eventName === "linear.agent_session_prompted") {
+    return event.type === "agent_session" && event.action === "prompted";
+  }
   if (eventName === "linear.issue_entered_scope") {
     return event.type === "issue" && (event.action === "create" || event.action === "update");
   }
@@ -123,6 +143,9 @@ function matchesTriggerFilter(
   event: NormalizedLinearEvent,
   connectionId?: string | null,
 ): boolean {
+  if (event.type === "agent_session") {
+    return matchesSessionScope(event, trigger.filters, connectionId);
+  }
   if (trigger.on === "linear.issue_entered_scope") {
     return (
       event.type === "issue" &&
@@ -135,6 +158,42 @@ function matchesTriggerFilter(
   if (!matchesActor(event, trigger.filters?.from_users)) return false;
   if (event.type === "comment" && !matchesCommentText(event, trigger.filters)) return false;
   return true;
+}
+
+/**
+ * A session is served by the trigger of its issue's team. The actor is whoever addressed the
+ * agent: the creator of a new session, the author of a follow-up prompt. A session without a
+ * responsible human is only accepted when the trigger opts into automations, and then
+ * `from_users` has nobody to check.
+ */
+export function matchesSessionScope(
+  event: NormalizedLinearAgentSessionEvent,
+  filter: TriggerFilter | undefined,
+  connectionId?: string | null,
+): boolean {
+  if (filter === undefined) return false;
+  if (filter.connectionId !== undefined && filter.connectionId !== connectionId) return false;
+  if (event.session.issue === null) return false;
+  if (filter.team !== event.session.issue.teamId) return false;
+  if (filter.source !== undefined && !filter.source.includes(linearSessionSource(event))) {
+    return false;
+  }
+  const actor = event.action === "created" ? event.session.creator : event.activity?.user;
+  if (actor === null || actor === undefined) return filter.allow_automations === true;
+  return matchesSessionActor(actor, filter.from_users, event.action === "prompted");
+}
+
+/**
+ * The only place `"*"` is honored, and only for follow-ups: a delegation runs code on the
+ * daemon, so the compiler refuses the wildcard on `created` and matching never honors it there.
+ */
+function matchesSessionActor(
+  actor: { id: string },
+  allowed: readonly string[] | undefined,
+  wildcard: boolean,
+): boolean {
+  if (allowed === undefined || allowed.length === 0) return false;
+  return (wildcard && allowed.includes("*")) || allowed.includes(actor.id);
 }
 
 /** The filter-specific edge check, separated to keep the generic event selection readable. */
@@ -165,14 +224,14 @@ function enteredConfiguredScope(
 }
 
 function matchesActorIfPresent(
-  event: NormalizedLinearEvent,
+  event: NormalizedLinearIssueEvent,
   allowed: readonly string[] | undefined,
 ): boolean {
   return allowed === undefined || allowed.length === 0 || matchesActor(event, allowed);
 }
 
 function matchesActor(
-  event: NormalizedLinearEvent,
+  event: NormalizedLinearIssueEvent | NormalizedLinearCommentEvent,
   allowed: readonly string[] | undefined,
 ): boolean {
   if (allowed === undefined || allowed.length === 0 || event.actor === null) return false;

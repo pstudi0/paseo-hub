@@ -1,0 +1,9 @@
+{
+  "type": "OAuthApp",
+  "action": "revoked",
+  "createdAt": "2026-09-15T11:05:00.000Z",
+  "organizationId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d00",
+  "oauthClientId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d03",
+  "webhookId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d60",
+  "webhookTimestamp": 1789466400000
+}

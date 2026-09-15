@@ -11,7 +11,10 @@ import {
 } from "../auth/github-events.js";
 import { NormalizedDiscordMessageEventSchema } from "../triggers/discord/events.js";
 import { NormalizedSlackMentionEventSchema } from "../triggers/slack/events.js";
-import { NormalizedLinearEventSchema } from "../triggers/linear/events.js";
+import {
+  NormalizedLinearEventSchema,
+  type NormalizedLinearAgentSessionEvent,
+} from "../triggers/linear/events.js";
 import { classifyGitHubEvent } from "../triggers/github/classification.js";
 
 export interface TriggerSummary {
@@ -179,6 +182,7 @@ function summarizeLinear(payload: unknown): TriggerSummary {
   if (!event.success) {
     return { provider: "linear", headline: "Linear event", actor: null, externalUrl: null };
   }
+  if (event.data.type === "agent_session") return summarizeLinearSession(event.data);
   const issue = event.data.type === "issue" ? event.data.issue : event.data.issue;
   if (issue === null) {
     return {
@@ -194,6 +198,18 @@ function summarizeLinear(payload: unknown): TriggerSummary {
     headline: `${prefix}: ${truncate(issue.title, 96)}`,
     actor: event.data.actor?.name ?? event.data.actor?.id ?? null,
     externalUrl: issue.url ?? null,
+  };
+}
+
+function summarizeLinearSession(event: NormalizedLinearAgentSessionEvent): TriggerSummary {
+  const actor = event.activity === null ? event.session.creator : event.activity.user;
+  const issue = event.session.issue;
+  return {
+    provider: "linear",
+    headline:
+      issue === null ? "Linear agent session" : `${issue.identifier}: ${truncate(issue.title, 96)}`,
+    actor: actor?.name ?? actor?.id ?? null,
+    externalUrl: event.session.url ?? issue?.url ?? null,
   };
 }
 

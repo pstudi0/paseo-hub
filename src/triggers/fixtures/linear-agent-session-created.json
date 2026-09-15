@@ -1,0 +1,72 @@
+{
+  "type": "AgentSessionEvent",
+  "action": "created",
+  "createdAt": "2026-09-15T10:00:00.250Z",
+  "organizationId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d00",
+  "oauthClientId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d03",
+  "appUserId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d02",
+  "webhookId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d60",
+  "webhookTimestamp": 1789466400000,
+  "agentSession": {
+    "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d30",
+    "appUserId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d02",
+    "organizationId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d00",
+    "status": "pending",
+    "type": "commentThread",
+    "issueId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d20",
+    "issue": {
+      "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d20",
+      "identifier": "LAB-42",
+      "title": "Fix the flaky daemon reconnect test",
+      "description": "The reconnect test fails once every ~20 runs on CI.",
+      "url": "https://linear.app/lab/issue/LAB-42/fix-the-flaky-daemon-reconnect-test",
+      "teamId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01",
+      "team": {
+        "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01",
+        "key": "LAB",
+        "name": "Lab"
+      }
+    },
+    "createdAt": "2026-09-15T10:00:00.000Z",
+    "updatedAt": "2026-09-15T10:00:00.000Z",
+    "creatorId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d10",
+    "creator": {
+      "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d10",
+      "name": "Anthony",
+      "email": "anthony@example.com",
+      "url": "https://linear.app/lab/profiles/anthony",
+      "avatarUrl": null
+    },
+    "commentId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d40",
+    "comment": {
+      "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d40",
+      "body": "",
+      "issueId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d20",
+      "userId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d02"
+    },
+    "url": "https://linear.app/lab/issue/LAB-42/fix-the-flaky-daemon-reconnect-test#agentSession-6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d30"
+  },
+  "promptContext": "<issue identifier=\"LAB-42\">\n<title>Fix the flaky daemon reconnect test</title>\n<description>The reconnect test fails once every ~20 runs on CI.</description>\n<team name=\"Lab\"/>\n</issue>\n\n<guidance><guidance-rule origin=\"organization\">Prefer small pull requests.</guidance-rule><guidance-rule origin=\"team\" team-name=\"Lab\">Run the daemon test suite before opening a pull request.</guidance-rule></guidance>",
+  "guidance": [
+    {
+      "body": "Prefer small pull requests.",
+      "origin": {
+        "type": "Organization"
+      }
+    },
+    {
+      "body": "Run the daemon test suite before opening a pull request.",
+      "origin": {
+        "type": "Team",
+        "team": {
+          "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01",
+          "key": "LAB",
+          "name": "Lab",
+          "displayName": "Lab",
+          "parentId": null
+        }
+      }
+    }
+  ],
+  "previousComments": []
+}

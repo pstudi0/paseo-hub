@@ -1,0 +1,39 @@
+{
+  "type": "AppUserNotification",
+  "action": "issueUnassignedFromYou",
+  "createdAt": "2026-09-15T11:10:00.000Z",
+  "organizationId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d00",
+  "oauthClientId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d03",
+  "appUserId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d02",
+  "notification": {
+    "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d70",
+    "type": "issueUnassignedFromYou",
+    "actorId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d10",
+    "actor": {
+      "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d10",
+      "name": "Anthony",
+      "email": "anthony@example.com",
+      "url": "https://linear.app/lab/profiles/anthony",
+      "avatarUrl": null
+    },
+    "issueId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d20",
+    "issue": {
+      "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d20",
+      "identifier": "LAB-42",
+      "title": "Fix the flaky daemon reconnect test",
+      "description": "The reconnect test fails once every ~20 runs on CI.",
+      "url": "https://linear.app/lab/issue/LAB-42/fix-the-flaky-daemon-reconnect-test",
+      "teamId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01",
+      "team": {
+        "id": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01",
+        "key": "LAB",
+        "name": "Lab"
+      }
+    },
+    "userId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d02",
+    "createdAt": "2026-09-15T11:10:00.000Z",
+    "updatedAt": "2026-09-15T11:10:00.000Z"
+  },
+  "webhookId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d60",
+  "webhookTimestamp": 1789466400000
+}

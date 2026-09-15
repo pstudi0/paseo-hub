@@ -3,6 +3,11 @@ import { createHash, createHmac } from "node:crypto";
 import { describe, it } from "vitest";
 import type { DurableProviderEvent, ProviderEventAcceptance } from "../../db/types.js";
 import {
+  fixtureRecord,
+  LINEAR_FIXTURE,
+  readLinearFixture,
+} from "../../test-utils/linear-fixtures.js";
+import {
   createLinearWebhookSource,
   verifyLinearSignature,
   verifyLinearWebhookTimestamp,
@@ -173,6 +178,42 @@ describe("Linear webhook", () => {
 
     assert.equal((await endpoint.handle(request(commentEnvelope(), "Comment"))).status, 503);
     assert.equal(accepted, false);
+  });
+
+  it("routes an agent session by its team and ignores one without an issue", async () => {
+    const accepted: Array<
+      Parameters<Parameters<typeof createLinearWebhookSource>[0]["accept"]>[0]
+    > = [];
+    let issueReads = 0;
+    const endpoint = createLinearWebhookSource({
+      signingSecret: SECRET,
+      now: () => NOW,
+      canHydrateIssue: async () => true,
+      resolveIssue: async () => {
+        issueReads += 1;
+        throw new Error("sessions are never hydrated at intake");
+      },
+      accept: async (input) => {
+        accepted.push(input);
+        return { status: "duplicate", receiptId: input.deliveryId };
+      },
+    });
+    const delivery = readLinearFixture("linear-agent-session-created");
+    delivery["webhookTimestamp"] = NOW;
+
+    assert.equal((await endpoint.handle(request(delivery, "AgentSessionEvent"))).status, 200);
+    assert.equal(accepted.length, 1);
+    assert.equal(accepted[0]?.resourceId, LINEAR_FIXTURE.teamId);
+    assert.equal(accepted[0]?.source, "linear.agent_session");
+
+    const orphan = readLinearFixture("linear-agent-session-created");
+    orphan["webhookTimestamp"] = NOW;
+    delete fixtureRecord(orphan["agentSession"])["issue"];
+    delete fixtureRecord(orphan["agentSession"])["issueId"];
+
+    assert.equal((await endpoint.handle(request(orphan, "AgentSessionEvent"))).status, 200);
+    assert.equal(issueReads, 0);
+    assert.equal(accepted.length, 1);
   });
 
   it("rejects unsigned and unavailable handoffs", async () => {

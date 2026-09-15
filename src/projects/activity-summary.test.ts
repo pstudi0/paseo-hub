@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
+import { LINEAR_FIXTURE, readLinearFixture } from "../test-utils/linear-fixtures.js";
+import { normalizeLinearEvent } from "../triggers/linear/events.js";
 import { summarizeTrigger } from "./activity-summary.js";
 
 describe("summarizeTrigger", () => {
@@ -163,6 +165,17 @@ describe("summarizeTrigger", () => {
       actor: "carol",
       externalUrl:
         "https://discord.com/channels/222222222222222222/333333333333333333/444444444444444444",
+    });
+  });
+
+  it("summarizes a Linear agent session with the issue identifier, actor and session link", () => {
+    const event = normalizeLinearEvent(readLinearFixture("linear-agent-session-prompted"));
+
+    assert.deepEqual(summarizeTrigger("linear.agent_session", event), {
+      provider: "linear",
+      headline: "LAB-42: Fix the flaky daemon reconnect test",
+      actor: "Anthony",
+      externalUrl: `https://linear.app/lab/issue/LAB-42/fix-the-flaky-daemon-reconnect-test#agentSession-${LINEAR_FIXTURE.sessionId}`,
     });
   });
 
