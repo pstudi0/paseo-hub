@@ -233,6 +233,18 @@ describe("Linear mirror", () => {
         detail: { type: "shell", command: "npm test" },
       },
     });
+    // A streaming tool repeats its running item; only the first one reaches Linear.
+    await observe({
+      type: "timeline",
+      provider: "claude",
+      item: {
+        type: "tool_call",
+        callId: "call-1",
+        name: "Bash",
+        status: "running",
+        detail: { type: "shell", command: "npm test" },
+      },
+    });
     await observe({
       type: "timeline",
       provider: "claude",

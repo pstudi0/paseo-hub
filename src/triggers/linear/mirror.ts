@@ -124,6 +124,9 @@ export function createLinearMirror(options: MirrorDependencies): LinearMirror {
   const records = new Map<string, CachedRecord>();
   const turns = new Map<string, number>();
   const lastMessages = new Map<string, string>();
+  /** Tool calls already mirrored per execution, as `${callId}:start|end`: a streaming tool
+   *  repeats its `running` item and Linear rejects a second activity with the same id. */
+  const mirroredCalls = new Map<string, Set<string>>();
   const now = options.now ?? Date.now;
 
   async function currentRecord(
@@ -265,6 +268,11 @@ export function createLinearMirror(options: MirrorDependencies): LinearMirror {
       const parsed = LinearMirrorToolCallSchema.safeParse(item);
       if (!parsed.success) return reportParse(parsed.error, target);
       if (isHubTool(parsed.data.name)) return;
+      const phase = parsed.data.status === "running" ? "start" : "end";
+      const seen = mirroredCalls.get(context.input.executionId) ?? new Set<string>();
+      if (seen.has(`${parsed.data.callId}:${phase}`)) return;
+      seen.add(`${parsed.data.callId}:${phase}`);
+      mirroredCalls.set(context.input.executionId, seen);
       void options.coordinator.emit(target, toolCallActivity(target, parsed.data));
       return;
     }
@@ -335,6 +343,7 @@ export function createLinearMirror(options: MirrorDependencies): LinearMirror {
       records.delete(executionId);
       turns.delete(executionId);
       lastMessages.delete(executionId);
+      mirroredCalls.delete(executionId);
     },
   };
 }
