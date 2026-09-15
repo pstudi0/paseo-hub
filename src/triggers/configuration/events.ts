@@ -28,8 +28,11 @@ const ADDED_LABEL: QualifierDefinition = {
   required: true,
 };
 
-/** How a Linear agent session was started; the vocabulary of the `source` filter. */
-export const LINEAR_SESSION_SOURCES = ["delegation", "mention", "proactive"] as const;
+/**
+ * How a Linear agent session was started; the vocabulary of the `source` filter. `automation`
+ * covers every session without a responsible human: triage rules, automations, and agent users.
+ */
+export const LINEAR_SESSION_SOURCES = ["delegation", "mention", "automation"] as const;
 export type LinearSessionSource = (typeof LINEAR_SESSION_SOURCES)[number];
 
 const LINEAR_TEAM: QualifierDefinition = {

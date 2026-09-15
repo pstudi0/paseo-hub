@@ -1,0 +1,13 @@
+{
+  "type": "PermissionChange",
+  "action": "teamAccessChanged",
+  "createdAt": "2026-09-15T11:00:00.000Z",
+  "organizationId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d00",
+  "oauthClientId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d03",
+  "appUserId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d02",
+  "canAccessAllPublicTeams": false,
+  "addedTeamIds": ["6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01"],
+  "removedTeamIds": [],
+  "webhookId": "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d60",
+  "webhookTimestamp": 1789466400000
+}
