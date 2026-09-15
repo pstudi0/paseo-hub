@@ -434,6 +434,105 @@ test.each(["github.issue_label_added", "github.pull_request_label_added"])(
   },
 );
 
+const LINEAR_TEAM_ID = "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01";
+const LINEAR_SESSION = ADVANCED.replace("slack.mention", "linear.agent_session_created")
+  .replace("channels: [engineering]", `team: ${LINEAR_TEAM_ID}\n      source: [delegation]`)
+  .replace("  github:", "  linear:\n    on_start: started\n  github:");
+
+test.each(["linear.agent_session_created", "linear.agent_session_prompted"])(
+  "edits the Linear session event %s once a team is named",
+  (event) => {
+    const yaml = ADVANCED.replace("slack.mention", event).replace(
+      "channels: [engineering]",
+      `team: ${LINEAR_TEAM_ID}`,
+    );
+    const projection = projectTriggerForm(yaml);
+    expect(projection).toMatchObject({
+      status: "editable",
+      value: { event, qualifiers: { team: LINEAR_TEAM_ID } },
+    });
+    expect(EDITOR_EVENTS).toContain(event);
+  },
+);
+
+test.each(["linear.agent_session_created", "linear.agent_session_prompted"])(
+  "requires a Linear team for %s",
+  (event) => {
+    const missing = ADVANCED.replace("slack.mention", event);
+    expect(TriggerDocumentSchema.safeParse(parseDocument(missing).toJS()).success).toBe(false);
+    const projection = projectTriggerForm(
+      missing.replace("channels: [engineering]", `team: ${LINEAR_TEAM_ID}`),
+    );
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    expect(triggerFormErrors({ ...projection.value, qualifiers: { team: "  " } })).toEqual({
+      "qualifiers.team": "Linear team is required.",
+    });
+    expect(triggerFormErrors({ ...projection.value, qualifiers: {} })).toEqual({
+      "qualifiers.team": "Linear team is required.",
+    });
+  },
+);
+
+test("round trips the Linear team and leaves the session-only YAML nodes alone", () => {
+  const projection = projectTriggerForm(LINEAR_SESSION);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  expect(projection.value.qualifiers).toEqual({ team: LINEAR_TEAM_ID });
+  expect(patchTriggerYaml(LINEAR_SESSION, projection.value)).toBe(LINEAR_SESSION);
+  const patched = patchTriggerYaml(LINEAR_SESSION, {
+    ...projection.value,
+    prompt: "Changed.",
+    qualifiers: { team: "another-team" },
+  });
+  const value = TriggerDocumentSchema.parse(parseDocument(patched).toJS());
+  expect(value.on["linear.agent_session_created"]?.filters).toEqual({
+    from_users: ["*"],
+    team: "another-team",
+    source: ["delegation"],
+  });
+  expect(value.run.linear).toEqual({ on_start: "started" });
+  expect(value.run.prompt).toBe("Changed.");
+});
+
+test("the Linear continuation is offered only to session events and is reset when the event leaves them", () => {
+  const projection = projectTriggerForm(LINEAR_SESSION);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const linear = { ...projection.value, continuationMode: "linear" };
+  expect(triggerFormErrors(linear)).toEqual({});
+  const yaml = patchTriggerYaml(LINEAR_SESSION, linear);
+  expect(projectTriggerForm(yaml)).toMatchObject({
+    status: "editable",
+    value: { continuationMode: "linear" },
+  });
+  const prompted = changeTriggerEvent(linear, "linear.agent_session_prompted");
+  expect(prompted.continuationMode).toBe("linear");
+  expect(prompted.qualifiers).toEqual({ team: LINEAR_TEAM_ID });
+  expect(prompted.connection).toBe(linear.connection);
+  const comment = changeTriggerEvent(linear, "linear.comment_created");
+  expect(comment.continuationMode).toBe("conversation");
+  expect(comment.qualifiers).toEqual({});
+  expect(comment.connection).toBe(linear.connection);
+  const slack = changeTriggerEvent(linear, "slack.mention");
+  expect(slack.continuationMode).toBe("conversation");
+  expect(slack.connection).toBe("");
+  expect(
+    triggerFormErrors({ ...slack, connection: "company", continuationMode: "linear" }),
+  ).toEqual({
+    continuationKey: "Linear session continuity is only available for Linear agent session events.",
+  });
+});
+
+test("a document with both session events stays in YAML", () => {
+  const both = LINEAR_SESSION.replace(
+    "inputs:",
+    `  linear.agent_session_prompted:\n    connection: company\n    filters:\n      from_users: ["*"]\n      team: ${LINEAR_TEAM_ID}\ninputs:`,
+  );
+  expect(TriggerDocumentSchema.safeParse(parseDocument(both).toJS()).success).toBe(true);
+  expect(projectTriggerForm(both)).toEqual({
+    status: "yaml_only",
+    reason: "The form supports exactly one event.",
+  });
+});
+
 test("continuation policies round-trip through the form and YAML", () => {
   const projection = projectTriggerForm(ADVANCED);
   if (projection.status !== "editable") throw new Error(projection.reason);

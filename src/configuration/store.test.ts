@@ -246,6 +246,122 @@ describe("ProjectConfigurationStore resource compilation", () => {
     }
   });
 
+  it("routes a Linear agent-session trigger by team through one Linear connection", async () => {
+    const database = createMemoryDatabase();
+    await enrollTestDaemon(database);
+    database.organizationConnectionUsage = () =>
+      Promise.resolve({ github: [], slack: [], discord: [], linear: [linear] });
+    const project = await database.createProject({
+      organizationId: "org_1",
+      name: "Linear agent project",
+      slug: "linear-agent-project",
+      createdByUserId: "user-1",
+    });
+    const store = new ProjectConfigurationStore(database, project.id);
+    const team = "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01";
+    const revision = await store.insertManualBundleRevision({
+      files: configurationBundleFixture(
+        dump({
+          environments: [
+            { name: "runner", kind: "daemon", daemon: TEST_DAEMON_SLUG, cwd: "/repo" },
+          ],
+          triggers: [
+            {
+              name: "delegated",
+              on: "linear.agent_session_created",
+              max_runtime: "1h",
+              filters: { connection: "acme-linear", team, from_users: ["user-anthony"] },
+              steps: [
+                {
+                  id: "run",
+                  environment: "runner",
+                  max_runtime: "30m",
+                  idle_timeout: "5m",
+                  agent: { provider: "codex" },
+                  prompt: [{ text: "Take the issue" }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      userId: "user-1",
+    });
+    const active = await store.activate(revision.id);
+    assert.deepEqual(active.configuration.triggers[0]?.filters, {
+      connection: "acme-linear",
+      team,
+      from_users: ["user-anthony"],
+      connectionId: linear.id,
+      resourceId: team,
+    });
+    database.findLinearConnection = async (linearOrganizationId) =>
+      linearOrganizationId === linear.linearOrganizationId ? linear : undefined;
+    // The route's resource is the team, so a session webhook routed by `session.issue.teamId`
+    // reaches this project (the webhook side names it `resourceId`; the store still says `projectId`).
+    const accepted = await database.acceptLinearEvent({
+      linearOrganizationId: linear.linearOrganizationId,
+      projectId: team,
+      deliveryId: "linear-session-created",
+      source: "linear.agent_session",
+      payload: {},
+      receivedAt: new Date(0),
+    });
+    assert.equal(accepted.status, "accepted");
+    if (accepted.status === "accepted") assert.equal(accepted.events[0]?.projectId, project.id);
+  });
+
+  it("names the Linear team when a session trigger cannot be routed", async () => {
+    const database = createMemoryDatabase();
+    await enrollTestDaemon(database);
+    database.organizationConnectionUsage = () =>
+      Promise.resolve({ github: [], slack: [], discord: [], linear: [] });
+    const project = await database.createProject({
+      organizationId: "org_1",
+      name: "Unrouted Linear agent project",
+      slug: "unrouted-linear-agent-project",
+      createdByUserId: "user-1",
+    });
+    const store = new ProjectConfigurationStore(database, project.id);
+    const revision = await store.insertManualBundleRevision({
+      files: configurationBundleFixture(
+        dump({
+          environments: [
+            { name: "runner", kind: "daemon", daemon: TEST_DAEMON_SLUG, cwd: "/repo" },
+          ],
+          triggers: [
+            {
+              name: "delegated",
+              on: "linear.agent_session_prompted",
+              max_runtime: "1h",
+              filters: { team: "team-1", from_users: ["*"] },
+              steps: [
+                {
+                  id: "run",
+                  environment: "runner",
+                  max_runtime: "30m",
+                  idle_timeout: "5m",
+                  agent: { provider: "codex" },
+                  prompt: [{ text: "Continue" }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      userId: "user-1",
+    });
+    assert.deepEqual(revision.validationErrors, {
+      formErrors: [],
+      issues: [
+        {
+          path: [".paseo/workflows/delegated.yml", "filters", "team"],
+          message: '"team-1" does not match any Linear team (connected: none)',
+        },
+      ],
+    });
+  });
+
   it("keeps authored prompt partials when switching a GitHub-managed configuration to manual", async () => {
     const database = createMemoryDatabase();
     await enrollTestDaemon(database);

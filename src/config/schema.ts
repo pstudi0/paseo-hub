@@ -20,6 +20,11 @@ import {
   type CompiledTrigger,
 } from "./compiler.js";
 import type { CompiledGitHubAuthority, GitHubPermissionLevel } from "./github-authority.js";
+import type {
+  AuthoredLinearAuthority,
+  CompiledLinearAuthority,
+  LinearStateSelector,
+} from "./linear-authority.js";
 
 export {
   HubConfigSchema,
@@ -47,6 +52,7 @@ export type CompiledConfiguration = CompiledHubConfig;
 export type CompiledTriggerConfig = CompiledTrigger;
 export type CompiledStepConfig = CompiledStep;
 export type { CompiledGitHubAuthority, GitHubPermissionLevel };
+export type { AuthoredLinearAuthority, CompiledLinearAuthority, LinearStateSelector };
 export type InputDefinition = AuthoredInput;
 export type CompiledInputDefinition = CompiledInput;
 export type WorktreeTarget = NonNullable<DaemonEnvironment["worktree"]>;

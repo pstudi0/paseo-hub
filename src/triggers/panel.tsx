@@ -42,7 +42,13 @@ import { saveTrigger, triggerSnapshot, type TriggerSnapshot } from "./functions.
 import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshot, HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
-import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
+import {
+  EDITOR_EVENTS,
+  eventDefinition,
+  isLinearAgentSessionEvent,
+  parseEditorEvent,
+  type EditorEvent,
+} from "./configuration/events.js";
 import { selectedProviderModel } from "./provider-catalog.js";
 
 type BrowserTrigger = TriggerSnapshot["triggers"][number];
@@ -74,6 +80,37 @@ const EVENT_OPTIONS: readonly ComboboxOption[] = EDITOR_EVENTS.map((value) => {
     icon: <ProviderGlyph provider={provider} />,
   };
 });
+
+const CONTINUITY_OPTIONS: readonly SegmentedOption[] = [
+  {
+    value: "conversation",
+    label: "Same conversation",
+    hint: "Continue the same agent for this conversation. Events without a conversation start a new agent. Archived workspaces are restored.",
+  },
+  {
+    value: "key",
+    label: "Custom key",
+    hint: "Arrivals with the same key in this project share an agent. Agent and workspace settings must match.",
+  },
+  {
+    value: "new",
+    label: "New agent",
+    hint: "Create a separate agent for every request.",
+  },
+] as const;
+
+const LINEAR_SESSION_CONTINUITY: SegmentedOption = {
+  value: "linear",
+  label: "Linear session",
+  hint: "One workspace per issue, one agent per Linear session. Follow-ups reuse the running agent; a new delegation gets a new agent in the issue's workspace.",
+};
+
+/** The continuity modes an event can use: only Linear agent sessions have a two-level mode. */
+function continuityOptions(event: EditorEvent): readonly SegmentedOption[] {
+  return isLinearAgentSessionEvent(event)
+    ? [...CONTINUITY_OPTIONS, LINEAR_SESSION_CONTINUITY]
+    : CONTINUITY_OPTIONS;
+}
 
 const TRIGGERS_DESCRIPTION = "Launch agents on your compute when organization events arrive.";
 const TRIGGER_EDITOR_DESCRIPTION = "One event launches one agent on your compute.";
@@ -841,23 +878,7 @@ function TriggerForm({
                 description="Agent continuity"
                 value={form.continuationMode}
                 onChange={text("continuationMode")}
-                options={[
-                  {
-                    value: "conversation",
-                    label: "Same conversation",
-                    hint: "Continue the same agent for this conversation. Events without a conversation start a new agent. Archived workspaces are restored.",
-                  },
-                  {
-                    value: "key",
-                    label: "Custom key",
-                    hint: "Arrivals with the same key in this project share an agent. Agent and workspace settings must match.",
-                  },
-                  {
-                    value: "new",
-                    label: "New agent",
-                    hint: "Create a separate agent for every request.",
-                  },
-                ]}
+                options={continuityOptions(form.event)}
               />
               {form.continuationMode === "key" ? (
                 <FormField

@@ -12,6 +12,7 @@ import { IDENTIFIER, TriggerDocumentSchema, type TriggerDocument } from "./schem
 import {
   eventDefinition,
   isEditorEvent,
+  isLinearAgentSessionEvent,
   type EditorEvent,
   type QualifierValues,
   type QualifierKey,
@@ -449,7 +450,16 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
       }
     }
   }
-  return { ...value, event, qualifiers, connection: sameProvider ? value.connection : "" };
+  return {
+    ...value,
+    event,
+    qualifiers,
+    connection: sameProvider ? value.connection : "",
+    continuationMode:
+      value.continuationMode === "linear" && !isLinearAgentSessionEvent(event)
+        ? "conversation"
+        : value.continuationMode,
+  };
 }
 
 function readQualifiers(
@@ -482,6 +492,12 @@ function formContinuation(value: TriggerFormValue) {
 }
 
 function continuationErrors(value: TriggerFormValue): TriggerFieldErrors {
+  if (value.continuationMode === "linear" && !isLinearAgentSessionEvent(value.event)) {
+    return {
+      continuationKey:
+        "Linear session continuity is only available for Linear agent session events.",
+    };
+  }
   return refused(() => formContinuation(value)) === undefined
     ? {}
     : { continuationKey: "Enter a continuation key or expression." };

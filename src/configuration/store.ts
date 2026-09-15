@@ -1,4 +1,5 @@
 import { parseTriggerDocument } from "../triggers/configuration/index.js";
+import { isLinearAgentSessionEvent } from "../triggers/configuration/events.js";
 import { dump, load } from "js-yaml";
 import { z } from "zod";
 import {
@@ -650,7 +651,7 @@ async function compileTriggers(
       });
       continue;
     }
-    const authored = readAuthoredResource(provider, filter);
+    const authored = readAuthoredResource(provider, filter, trigger.on);
     const candidates = connectionCandidates(provider, usage, filter);
     const authoredConnection = filter?.connection;
     if (typeof authoredConnection === "string" && candidates.length === 0) {
@@ -670,8 +671,8 @@ async function compileTriggers(
       );
       if (resolved === undefined) {
         issues.push({
-          path: triggerFilterPath(trigger, resourceField(provider)),
-          message: `"${authored}" does not match any ${resourceLabel(provider)} (${await formatResourceCandidates(
+          path: triggerFilterPath(trigger, resourceField(provider, trigger.on)),
+          message: `"${authored}" does not match any ${resourceLabel(provider, trigger.on)} (${await formatResourceCandidates(
             database,
             organizationId,
             provider,
@@ -683,7 +684,7 @@ async function compileTriggers(
       const resolvedFilter =
         provider === "github"
           ? filter
-          : { ...filter, [resourceField(provider)]: resolved.resourceId };
+          : { ...filter, [resourceField(provider, trigger.on)]: resolved.resourceId };
       const nextFilter: CompiledTriggerFilter = {
         ...resolvedFilter,
         connectionId: resolved.connectionId,
@@ -729,13 +730,10 @@ function providerForEvent(eventName: string): ConnectionProvider | undefined {
 function readAuthoredResource(
   provider: ConnectionProvider,
   filters: CompiledTrigger["filters"] | undefined,
+  eventName: string,
 ): string | undefined {
   if (filters === undefined) return undefined;
-  let value: string | undefined;
-  if (provider === "github") value = filters.repo;
-  else if (provider === "slack") value = filters.workspace;
-  else if (provider === "discord") value = filters.guild;
-  else value = filters.project;
+  const value = filters[resourceField(provider, eventName)];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
@@ -793,10 +791,15 @@ function triggerFilterPath(trigger: CompiledTrigger, field: string): readonly (s
   return [trigger.sourceFile ?? ".paseo/workflows", "filters", field];
 }
 
-function resourceField(provider: ConnectionProvider): "repo" | "workspace" | "guild" | "project" {
+/** Linear routes agent-session events by team and every other event by project. */
+function resourceField(
+  provider: ConnectionProvider,
+  eventName: string,
+): "repo" | "workspace" | "guild" | "project" | "team" {
   if (provider === "github") return "repo";
   if (provider === "slack") return "workspace";
-  return provider === "discord" ? "guild" : "project";
+  if (provider === "discord") return "guild";
+  return isLinearAgentSessionEvent(eventName) ? "team" : "project";
 }
 
 function providerLabel(provider: ConnectionProvider): string {
@@ -805,9 +808,11 @@ function providerLabel(provider: ConnectionProvider): string {
   return provider === "discord" ? "Discord" : "Linear";
 }
 
-function resourceLabel(provider: ConnectionProvider): string {
+function resourceLabel(provider: ConnectionProvider, eventName: string): string {
   if (provider === "github") return "GitHub repository";
-  if (provider === "linear") return "Linear project";
+  if (provider === "linear") {
+    return isLinearAgentSessionEvent(eventName) ? "Linear team" : "Linear project";
+  }
   return `${providerLabel(provider)} connection`;
 }
 

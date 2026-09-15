@@ -6,7 +6,9 @@ export type ExpressionPath =
       path: "prompt" | "context" | ["inputs", string] | ["execution", "id"];
     }
   | { namespace: "steps"; stepId: string; path: readonly string[] }
-  | { namespace: "values"; name: string };
+  | { namespace: "values"; name: string }
+  /** The Linear issue an agent session belongs to; only `worktree.newBranch` may read it. */
+  | { namespace: "linear"; path: ["issue", "identifier"] };
 
 export type Expression =
   | { kind: "literal"; value: JsonValue }
@@ -26,6 +28,11 @@ export interface ExpressionContext {
   steps: Readonly<Record<string, { status: string; output: unknown }>>;
   values: Readonly<Record<string, Expression>>;
   executionId?: string;
+  linear?: LinearExpressionContext;
+}
+
+export interface LinearExpressionContext {
+  issue: { identifier: string };
 }
 
 export class ExpressionSyntaxError extends Error {
@@ -123,6 +130,14 @@ export function parseExpression(source: string): Expression {
     }
     if (parts[0] === "values" && parts.length === 2) {
       return { kind: "path", value: { namespace: "values", name: parts[1]! } };
+    }
+    if (
+      parts[0] === "linear" &&
+      parts.length === 3 &&
+      parts[1] === "issue" &&
+      parts[2] === "identifier"
+    ) {
+      return { kind: "path", value: { namespace: "linear", path: ["issue", "identifier"] } };
     }
     throw new ExpressionSyntaxError(`unsupported path ${parts.join(".")}`);
   }
@@ -247,8 +262,17 @@ export function renderExpressionTemplate(template: string, context: ExpressionCo
   return result;
 }
 
-export function renderExecutionTemplate(template: string, executionId: string): string {
-  validateExecutionTemplate(template);
+export interface ExecutionTemplateOptions {
+  /** Whether `linear.issue.identifier` may be read: only for Linear agent-session triggers. */
+  allowLinearIssue?: boolean;
+}
+
+export function renderExecutionTemplate(
+  template: string,
+  executionId: string,
+  linear?: LinearExpressionContext,
+): string {
+  validateExecutionTemplate(template, { allowLinearIssue: linear !== undefined });
   return renderExpressionTemplate(template, {
     prompt: "",
     context: null,
@@ -256,11 +280,21 @@ export function renderExecutionTemplate(template: string, executionId: string): 
     steps: {},
     values: {},
     executionId,
+    ...(linear === undefined ? {} : { linear }),
   });
 }
 
-export function validateExecutionTemplate(template: string): void {
+export function validateExecutionTemplate(
+  template: string,
+  options: ExecutionTemplateOptions = {},
+): void {
   for (const path of expressionPathsInTemplate(template)) {
+    if (path.namespace === "linear") {
+      if (options.allowLinearIssue === true) continue;
+      throw new ExpressionSyntaxError(
+        "execution templates support linear.issue.identifier only for Linear agent session triggers",
+      );
+    }
     if (
       path.namespace !== "paseo" ||
       !Array.isArray(path.path) ||
@@ -387,6 +421,12 @@ function readPath(path: ExpressionPath, context: ExpressionContext): JsonValue {
       return context.executionId;
     }
     return context.inputs[path.path[1]] ?? null;
+  }
+  if (path.namespace === "linear") {
+    if (context.linear === undefined) {
+      throw new ExpressionEvaluationError("Linear issue identifier is unavailable");
+    }
+    return context.linear.issue.identifier;
   }
   if (path.namespace === "values") {
     const expression = context.values[path.name];
