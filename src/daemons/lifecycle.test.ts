@@ -375,6 +375,7 @@ async function acknowledgementFixture() {
     organizationId: "org-ack-test",
     projectId: "project-ack-test",
     continuationKey: null,
+    workspaceKey: null,
     daemonId: DAEMON_ID,
     agentId: AGENT_ID,
     workspaceId: "workspace",

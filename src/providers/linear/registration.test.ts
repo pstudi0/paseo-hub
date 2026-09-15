@@ -138,6 +138,7 @@ describe("Linear registration", () => {
             refreshToken: "refresh-token",
             accessTokenExpiresAt: null,
             scopes: ["read"],
+            teamAccess: null,
           },
         ],
       }),
@@ -156,6 +157,7 @@ describe("Linear registration", () => {
       refreshToken: null,
       accessTokenExpiresAt: new Date(0),
       scopes: ["read", "comments:create"],
+      teamAccess: null,
     };
     assert.deepEqual(
       registration.connection.status({ github: [], discord: [], slack: [], linear: [expired] }),
@@ -188,13 +190,14 @@ describe("Linear registration", () => {
             refreshToken: "refresh-token",
             accessTokenExpiresAt: null,
             scopes: ["comments:create"],
+            teamAccess: null,
           }
         : undefined;
     let accepts = 0;
-    let acceptedProjectId: string | undefined;
+    let acceptedResourceId: string | undefined;
     database.acceptLinearEvent = async (input) => {
       accepts += 1;
-      acceptedProjectId = input.projectId;
+      acceptedResourceId = input.resourceId;
       return {
         status: "dropped",
         receiptId: input.deliveryId,
@@ -224,7 +227,7 @@ describe("Linear registration", () => {
     assert.equal(response.status, 200);
     assert.equal(issueReads, 0);
     assert.equal(accepts, 1);
-    assert.equal(acceptedProjectId, undefined);
+    assert.equal(acceptedResourceId, undefined);
   });
 });
 

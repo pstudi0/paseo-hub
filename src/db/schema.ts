@@ -33,6 +33,15 @@ export const PROJECT_STATUSES = ["active", "archived"] as const;
 export const CONFIGURATION_SOURCE_KINDS = ["github", "manual"] as const;
 export const TRIGGER_FORMATS = ["single_run", "legacy_multistep"] as const;
 export const CONNECTION_PROVIDERS = ["github", "slack", "discord", "linear"] as const;
+/** Linear `AgentSessionStatus` vocabulary mirrored by `linear_agent_sessions.mirror_status`. */
+export const LINEAR_AGENT_SESSION_STATUSES = [
+  "pending",
+  "active",
+  "awaitingInput",
+  "complete",
+  "error",
+  "stale",
+] as const;
 
 export type MachineSource =
   | { kind: "manual"; userId?: string }
@@ -696,10 +705,13 @@ export const agentSessions = pgTable(
       .notNull()
       .references(() => projects.id),
     continuationKey: text("continuation_key"),
+    workspaceKey: text("workspace_key"),
     data: jsonb().$type<import("../agent-sessions/index.js").AgentSessionRecord>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex("agent_sessions_project_key_unique").on(table.projectId, table.continuationKey),
+    index("agent_sessions_project_workspace_key_idx").on(table.projectId, table.workspaceKey),
   ],
 );
 
@@ -1049,6 +1061,8 @@ export const linearConnections = pgTable(
       .$type<string[]>()
       .notNull()
       .default(sql`'[]'::jsonb`),
+    /** Team visibility granted to the app, fed by Linear `PermissionChange` webhooks. */
+    teamAccess: jsonb("team_access").$type<import("./types.js").LinearTeamAccess>(),
     connectedByUserId: text("connected_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -1062,6 +1076,72 @@ export const linearConnections = pgTable(
       table.organizationId,
       table.linearOrganizationId,
     ),
+  ],
+);
+
+/**
+ * One row per Linear agent session delegated to Hub: it binds the Linear session to the Hub agent
+ * session, the current execution and the daemon agent, and carries the timeline mirror state.
+ * Deleting the Linear connection cascades here, so a disconnect erases the mirror.
+ */
+export const linearAgentSessions = pgTable(
+  "linear_agent_sessions",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    linearConnectionId: uuid("linear_connection_id").notNull(),
+    linearOrganizationId: text("linear_organization_id").notNull(),
+    linearSessionId: text("linear_session_id").notNull(),
+    issueId: text("issue_id").notNull(),
+    issueIdentifier: text("issue_identifier"),
+    teamId: text("team_id").notNull(),
+    projectId: uuid("project_id").references(() => projects.id),
+    agentSessionId: uuid("agent_session_id").references(() => agentSessions.id),
+    currentExecutionId: uuid("current_execution_id").references(() => agentExecutions.id, {
+      onDelete: "set null",
+    }),
+    daemonId: uuid("daemon_id"),
+    daemonAgentId: text("daemon_agent_id"),
+    daemonWorkspaceId: text("daemon_workspace_id"),
+    mirrorStatus: text("mirror_status")
+      .$type<import("./types.js").LinearAgentSessionMirrorStatus>()
+      .notNull()
+      .default("pending"),
+    respondedAt: timestamp("responded_at", { withTimezone: true }),
+    lastActivityId: text("last_activity_id"),
+    lastActivityAt: timestamp("last_activity_at", { withTimezone: true }),
+    lastAssistantMessage: text("last_assistant_message"),
+    pullRequestUrl: text("pull_request_url"),
+    pendingPermission:
+      jsonb("pending_permission").$type<import("./types.js").LinearPendingPermission>(),
+    pendingPrompts: jsonb("pending_prompts")
+      .$type<import("./types.js").LinearPendingPrompt[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    stopRequestedAt: timestamp("stop_requested_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("linear_agent_sessions_linear_session_unique").on(table.linearSessionId),
+    uniqueIndex("linear_agent_sessions_id_organization_unique").on(table.id, table.organizationId),
+    index("linear_agent_sessions_linear_organization_issue_idx").on(
+      table.linearOrganizationId,
+      table.issueId,
+    ),
+    index("linear_agent_sessions_agent_session_idx").on(table.agentSessionId),
+    index("linear_agent_sessions_current_execution_idx").on(table.currentExecutionId),
+    check(
+      "linear_agent_sessions_mirror_status_check",
+      sql`${table.mirrorStatus} in ('pending', 'active', 'awaitingInput', 'complete', 'error', 'stale')`,
+    ),
+    foreignKey({
+      columns: [table.linearConnectionId, table.organizationId],
+      foreignColumns: [linearConnections.id, linearConnections.organizationId],
+      name: "linear_agent_sessions_connection_organization_fk",
+    }).onDelete("cascade"),
   ],
 );
 

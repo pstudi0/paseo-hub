@@ -45,7 +45,7 @@ describe("Linear webhook", () => {
     );
     assert.deepEqual(accepted[0], {
       linearOrganizationId: "linear-org",
-      projectId: "project-1",
+      resourceId: "project-1",
       deliveryId: "delivery-1",
       signatureHash: acceptedSignatureHash(),
       source: "linear.issue",
@@ -128,7 +128,7 @@ describe("Linear webhook", () => {
     });
 
     assert.equal((await endpoint.handle(request(commentEnvelope(), "Comment"))).status, 200);
-    assert.equal(accepted[0]?.projectId, "project-1");
+    assert.equal(accepted[0]?.resourceId, "project-1");
     assert.equal(accepted[0]?.source, "linear.comment");
   });
 
@@ -154,7 +154,7 @@ describe("Linear webhook", () => {
     assert.equal((await endpoint.handle(request(commentEnvelope(), "Comment"))).status, 200);
     assert.equal(issueReads, 0);
     assert.equal(accepted.length, 1);
-    assert.equal(accepted[0]?.projectId, undefined);
+    assert.equal(accepted[0]?.resourceId, undefined);
     assert.equal(accepted[0]?.dropReason, undefined);
   });
 
@@ -250,7 +250,7 @@ function acceptedEvent(
         payload: input.payload,
         receivedAt: input.receivedAt,
         connectionId: "linear-connection",
-        resourceId: input.projectId ?? null,
+        resourceId: input.resourceId ?? null,
       },
     ],
   };

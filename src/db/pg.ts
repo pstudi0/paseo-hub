@@ -24,7 +24,12 @@ import {
   toProviderEventReceiptSummary,
   toProviderEventReceiptRecord,
 } from "./mappers.js";
-import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
+import {
+  LINEAR_AGENT_SESSION_STATUSES,
+  type AgentExecutionStatus,
+  type MachineSource,
+  type MachineStatus,
+} from "./schema.js";
 import type { DatabaseRuntime, QueryHandle, QueryRow } from "./runtime/index.js";
 import type { Locks } from "./runtime/locks/index.js";
 import type {
@@ -75,6 +80,16 @@ import type {
   GitHubLifecycleReceiptClaim,
   GitHubLifecycleReceiptClaimInput,
   GitHubLifecycleResult,
+  LinearAgentSessionMirrorStatus,
+  LinearAgentSessionPatch,
+  LinearAgentSessionRecord,
+  LinearLifecycleReceiptClaim,
+  LinearLifecycleReceiptClaimInput,
+  LinearLifecycleResult,
+  LinearPendingPermission,
+  LinearPendingPrompt,
+  LinearTeamAccess,
+  UpsertLinearAgentSessionInput,
   PersistManualEventInput,
   ProjectConfigurationReadModel,
   ProjectConfigurationRevisionRecord,
@@ -183,6 +198,21 @@ class PgDatabase implements Database {
 
   releaseGitHubLifecycleReceipt(providerEventReceiptId: string) {
     return this.triggerAcceptance.releaseGitHubLifecycleReceipt(providerEventReceiptId);
+  }
+
+  claimLinearLifecycleReceipt(input: LinearLifecycleReceiptClaimInput) {
+    return this.triggerAcceptance.claimLinearLifecycleReceipt(input);
+  }
+
+  applyLinearLifecycle(
+    claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
+    result: LinearLifecycleResult,
+  ) {
+    return this.triggerAcceptance.applyLinearLifecycle(claim, result);
+  }
+
+  releaseLinearLifecycleReceipt(providerEventReceiptId: string) {
+    return this.triggerAcceptance.releaseLinearLifecycleReceipt(providerEventReceiptId);
   }
 
   async markProviderEventDropped(
@@ -2741,30 +2771,54 @@ class PgDatabase implements Database {
   }
 
   async findAgentSession(id: string) {
-    const result = await this.pool.query<{
-      data: import("../agent-sessions/index.js").AgentSessionRecord;
-    }>("select data from agent_sessions where id = $1", [id]);
-    return result.rows[0]?.data;
+    const result = await this.pool.query<AgentSessionDataRow>(
+      "select data from agent_sessions where id = $1",
+      [id],
+    );
+    return result.rows[0] === undefined ? undefined : toAgentSessionRecord(result.rows[0]);
   }
 
   async saveAgentSession(
     session: import("../agent-sessions/index.js").AgentSessionRecord,
   ): Promise<void> {
     await this.pool.query(
-      `insert into agent_sessions (id, organization_id, project_id, continuation_key, data)
-       values ($1, $2, $3, $4, $5) on conflict (id) do update set data = excluded.data, continuation_key = excluded.continuation_key`,
-      [session.id, session.organizationId, session.projectId, session.continuationKey, session],
+      `insert into agent_sessions (id, organization_id, project_id, continuation_key, data, workspace_key)
+       values ($1, $2, $3, $4, $5, $6)
+       on conflict (id) do update
+       set data = excluded.data,
+           continuation_key = excluded.continuation_key,
+           workspace_key = excluded.workspace_key`,
+      [
+        session.id,
+        session.organizationId,
+        session.projectId,
+        session.continuationKey,
+        session,
+        session.workspaceKey ?? null,
+      ],
     );
   }
 
   async findAgentSessionByKey(projectId: string, key: string) {
-    const result = await this.pool.query<{
-      data: import("../agent-sessions/index.js").AgentSessionRecord;
-    }>("select data from agent_sessions where project_id = $1 and continuation_key = $2", [
-      projectId,
-      key,
-    ]);
-    return result.rows[0]?.data;
+    const result = await this.pool.query<AgentSessionDataRow>(
+      "select data from agent_sessions where project_id = $1 and continuation_key = $2",
+      [projectId, key],
+    );
+    return result.rows[0] === undefined ? undefined : toAgentSessionRecord(result.rows[0]);
+  }
+
+  async findAgentSessionsByWorkspaceKey(projectId: string, workspaceKey: string) {
+    try {
+      const result = await this.pool.query<AgentSessionDataRow>(
+        `select data from agent_sessions
+         where project_id = $1 and workspace_key = $2
+         order by created_at desc, id desc`,
+        [projectId, workspaceKey],
+      );
+      return result.rows.map(toAgentSessionRecord);
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
   }
 
   async attachExecutionToSession(
@@ -2788,6 +2842,228 @@ class PgDatabase implements Database {
       [sessionId],
     );
     return result.rows.map(toAgentExecutionRecord);
+  }
+
+  async upsertLinearAgentSession(
+    input: UpsertLinearAgentSessionInput,
+  ): Promise<{ record: LinearAgentSessionRecord; created: boolean }> {
+    try {
+      const inserted = await query<LinearAgentSessionRow>(
+        this.pool,
+        `
+          insert into linear_agent_sessions (
+            organization_id,
+            linear_connection_id,
+            linear_organization_id,
+            linear_session_id,
+            issue_id,
+            issue_identifier,
+            team_id
+          )
+          values ($1, $2, $3, $4, $5, $6, $7)
+          on conflict (linear_session_id) do nothing
+          returning *
+        `,
+        [
+          input.organizationId,
+          input.linearConnectionId,
+          input.linearOrganizationId,
+          input.linearSessionId,
+          input.issueId,
+          input.issueIdentifier ?? null,
+          input.teamId,
+        ],
+      );
+      const row = inserted.rows[0];
+      if (row !== undefined) return { record: toLinearAgentSessionRecord(row), created: true };
+      const existing = await this.findLinearAgentSession(input.linearSessionId);
+      if (existing === undefined) {
+        throw new Error(`linear agent session unavailable: ${input.linearSessionId}`);
+      }
+      return { record: existing, created: false };
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
+  }
+
+  async findLinearAgentSession(
+    linearSessionId: string,
+  ): Promise<LinearAgentSessionRecord | undefined> {
+    try {
+      const rows = await query<LinearAgentSessionRow>(
+        this.pool,
+        "select * from linear_agent_sessions where linear_session_id = $1 limit 1",
+        [linearSessionId],
+      );
+      return rows.rows[0] === undefined ? undefined : toLinearAgentSessionRecord(rows.rows[0]);
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
+  }
+
+  async listLinearAgentSessionsForIssue(
+    linearOrganizationId: string,
+    issueId: string,
+  ): Promise<LinearAgentSessionRecord[]> {
+    try {
+      const rows = await query<LinearAgentSessionRow>(
+        this.pool,
+        `select * from linear_agent_sessions
+         where linear_organization_id = $1 and issue_id = $2
+         order by created_at desc, id desc`,
+        [linearOrganizationId, issueId],
+      );
+      return rows.rows.map(toLinearAgentSessionRecord);
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
+  }
+
+  async updateLinearAgentSession(
+    linearSessionId: string,
+    patch: LinearAgentSessionPatch,
+  ): Promise<LinearAgentSessionRecord | undefined> {
+    try {
+      const rows = await query<LinearAgentSessionRow>(
+        this.pool,
+        `
+          update linear_agent_sessions
+          set
+            project_id = case when $2::boolean then $3::uuid else project_id end,
+            agent_session_id = case when $4::boolean then $5::uuid else agent_session_id end,
+            current_execution_id = case
+              when $6::boolean then $7::uuid
+              else current_execution_id
+            end,
+            daemon_id = case when $8::boolean then $9::uuid else daemon_id end,
+            daemon_agent_id = case when $10::boolean then $11::text else daemon_agent_id end,
+            daemon_workspace_id = case
+              when $12::boolean then $13::text
+              else daemon_workspace_id
+            end,
+            mirror_status = case when $14::boolean then $15::text else mirror_status end,
+            responded_at = case when $16::boolean then $17::timestamptz else responded_at end,
+            last_activity_id = case when $18::boolean then $19::text else last_activity_id end,
+            last_activity_at = case
+              when $20::boolean then $21::timestamptz
+              else last_activity_at
+            end,
+            last_assistant_message = case
+              when $22::boolean then $23::text
+              else last_assistant_message
+            end,
+            pull_request_url = case when $24::boolean then $25::text else pull_request_url end,
+            pending_permission = case
+              when $26::boolean then $27::jsonb
+              else pending_permission
+            end,
+            stop_requested_at = case
+              when $28::boolean then $29::timestamptz
+              else stop_requested_at
+            end,
+            updated_at = clock_timestamp()
+          where linear_session_id = $1
+          returning *
+        `,
+        [
+          linearSessionId,
+          patch.projectId !== undefined,
+          patch.projectId ?? null,
+          patch.agentSessionId !== undefined,
+          patch.agentSessionId ?? null,
+          patch.currentExecutionId !== undefined,
+          patch.currentExecutionId ?? null,
+          patch.daemonId !== undefined,
+          patch.daemonId ?? null,
+          patch.daemonAgentId !== undefined,
+          patch.daemonAgentId ?? null,
+          patch.daemonWorkspaceId !== undefined,
+          patch.daemonWorkspaceId ?? null,
+          patch.mirrorStatus !== undefined,
+          patch.mirrorStatus ?? null,
+          patch.respondedAt !== undefined,
+          patch.respondedAt ?? null,
+          patch.lastActivityId !== undefined,
+          patch.lastActivityId ?? null,
+          patch.lastActivityAt !== undefined,
+          patch.lastActivityAt ?? null,
+          patch.lastAssistantMessage !== undefined,
+          patch.lastAssistantMessage ?? null,
+          patch.pullRequestUrl !== undefined,
+          patch.pullRequestUrl ?? null,
+          patch.pendingPermission !== undefined,
+          patch.pendingPermission === undefined || patch.pendingPermission === null
+            ? null
+            : JSON.stringify(patch.pendingPermission),
+          patch.stopRequestedAt !== undefined,
+          patch.stopRequestedAt ?? null,
+        ],
+      );
+      return rows.rows[0] === undefined ? undefined : toLinearAgentSessionRecord(rows.rows[0]);
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
+  }
+
+  async appendLinearPendingPrompt(
+    linearSessionId: string,
+    prompt: LinearPendingPrompt,
+  ): Promise<LinearAgentSessionRecord | undefined> {
+    try {
+      const rows = await query<LinearAgentSessionRow>(
+        this.pool,
+        `
+          update linear_agent_sessions
+          set pending_prompts = pending_prompts || $2::jsonb, updated_at = clock_timestamp()
+          where linear_session_id = $1
+          returning *
+        `,
+        [linearSessionId, JSON.stringify(prompt)],
+      );
+      return rows.rows[0] === undefined ? undefined : toLinearAgentSessionRecord(rows.rows[0]);
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
+  }
+
+  async takeLinearPendingPrompts(linearSessionId: string): Promise<LinearPendingPrompt[]> {
+    try {
+      // The row lock inside the CTE serializes concurrent takers: the second one re-reads the
+      // emptied queue after the first commits, so every prompt is handed out exactly once.
+      const rows = await query<{ pending_prompts: unknown }>(
+        this.pool,
+        `
+          with previous as (
+            select id, pending_prompts
+            from linear_agent_sessions
+            where linear_session_id = $1
+            for update
+          )
+          update linear_agent_sessions as current
+          set pending_prompts = '[]'::jsonb, updated_at = clock_timestamp()
+          from previous
+          where current.id = previous.id
+          returning previous.pending_prompts as pending_prompts
+        `,
+        [linearSessionId],
+      );
+      return rows.rows[0] === undefined ? [] : linearPendingPrompts(rows.rows[0].pending_prompts);
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
+  }
+
+  async findOrganizationSlug(organizationId: string): Promise<string | undefined> {
+    try {
+      const rows = await query<{ slug: string }>(
+        this.pool,
+        "select slug from organization where id = $1 limit 1",
+        [organizationId],
+      );
+      return rows.rows[0]?.slug;
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
   }
 
   async withAdvisoryLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -3906,12 +4182,13 @@ class PgDatabase implements Database {
         refresh_token: string | null;
         access_token_expires_at: Date | null;
         scopes: unknown;
+        team_access: unknown;
         provider_application_id: string | null;
       }>(
         this.pool,
         `select id, organization_id, slug, linear_organization_id, linear_organization_name,
                 app_user_id, access_token, refresh_token, access_token_expires_at, scopes,
-                provider_application_id
+                team_access, provider_application_id
          from linear_connections where organization_id = $1
          order by linear_organization_name, id`,
         [organizationId],
@@ -3959,6 +4236,7 @@ class PgDatabase implements Database {
         refreshToken: row.refresh_token,
         accessTokenExpiresAt: row.access_token_expires_at,
         scopes: stringArray(row.scopes),
+        teamAccess: linearTeamAccess(row.team_access),
         providerApplicationId: row.provider_application_id,
       })),
     };
@@ -4350,6 +4628,164 @@ async function query<T extends QueryRow = QueryRow>(
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function linearTeamAccess(value: unknown): LinearTeamAccess | null {
+  if (!isRecord(value)) return null;
+  const canAccessAllPublicTeams = value["canAccessAllPublicTeams"];
+  const updatedAt = value["updatedAt"];
+  if (typeof canAccessAllPublicTeams !== "boolean" || typeof updatedAt !== "string") return null;
+  return { canAccessAllPublicTeams, teamIds: stringArray(value["teamIds"]), updatedAt };
+}
+
+function linearPermissionOption(option: unknown): LinearPendingPermission["options"][number] {
+  const behavior = isRecord(option) ? option["behavior"] : undefined;
+  if (
+    !isRecord(option) ||
+    typeof option["value"] !== "string" ||
+    typeof option["label"] !== "string" ||
+    (behavior !== "allow" && behavior !== "deny")
+  ) {
+    throw new Error("invalid linear pending permission option");
+  }
+  return {
+    value: option["value"],
+    label: option["label"],
+    behavior,
+    ...(typeof option["selectedActionId"] === "string"
+      ? { selectedActionId: option["selectedActionId"] }
+      : {}),
+    ...(typeof option["forSession"] === "boolean" ? { forSession: option["forSession"] } : {}),
+  };
+}
+
+function linearPendingPermission(value: unknown): LinearPendingPermission | null {
+  if (!isRecord(value)) return null;
+  const requestId = value["requestId"];
+  const agentId = value["agentId"];
+  const executionId = value["executionId"];
+  const activityId = value["activityId"];
+  const options = value["options"];
+  const suggestions = value["suggestions"];
+  if (
+    typeof requestId !== "string" ||
+    typeof agentId !== "string" ||
+    typeof executionId !== "string" ||
+    typeof activityId !== "string" ||
+    !Array.isArray(options) ||
+    !Array.isArray(suggestions)
+  ) {
+    throw new Error("invalid linear pending permission");
+  }
+  return {
+    requestId,
+    agentId,
+    executionId,
+    activityId,
+    options: options.map(linearPermissionOption),
+    suggestions: suggestions.map((suggestion: unknown) => {
+      if (!isRecord(suggestion)) throw new Error("invalid linear pending permission suggestion");
+      return suggestion;
+    }),
+  };
+}
+
+interface AgentSessionDataRow extends QueryRow {
+  data: import("../agent-sessions/index.js").AgentSessionRecord;
+}
+
+/** Rows written before `workspace_key` existed carry no `workspaceKey` in their jsonb. */
+function toAgentSessionRecord(
+  row: AgentSessionDataRow,
+): import("../agent-sessions/index.js").AgentSessionRecord {
+  return { ...row.data, workspaceKey: row.data.workspaceKey ?? null };
+}
+
+export interface LinearAgentSessionRow extends QueryRow {
+  id: string;
+  organization_id: string;
+  linear_connection_id: string;
+  linear_organization_id: string;
+  linear_session_id: string;
+  issue_id: string;
+  issue_identifier: string | null;
+  team_id: string;
+  project_id: string | null;
+  agent_session_id: string | null;
+  current_execution_id: string | null;
+  daemon_id: string | null;
+  daemon_agent_id: string | null;
+  daemon_workspace_id: string | null;
+  mirror_status: string;
+  responded_at: Date | null;
+  last_activity_id: string | null;
+  last_activity_at: Date | null;
+  last_assistant_message: string | null;
+  pull_request_url: string | null;
+  pending_permission: unknown;
+  pending_prompts: unknown;
+  stop_requested_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function linearMirrorStatus(value: string): LinearAgentSessionMirrorStatus {
+  const status = LINEAR_AGENT_SESSION_STATUSES.find((candidate) => candidate === value);
+  if (status === undefined) throw new Error(`invalid linear agent session status: ${value}`);
+  return status;
+}
+
+function linearPendingPrompts(value: unknown): LinearPendingPrompt[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((prompt: unknown) => {
+    if (
+      !isRecord(prompt) ||
+      typeof prompt["activityId"] !== "string" ||
+      typeof prompt["body"] !== "string" ||
+      typeof prompt["receivedAt"] !== "string"
+    ) {
+      throw new Error("invalid linear pending prompt");
+    }
+    return {
+      activityId: prompt["activityId"],
+      body: prompt["body"],
+      receivedAt: prompt["receivedAt"],
+    };
+  });
+}
+
+function toLinearAgentSessionRecord(row: LinearAgentSessionRow): LinearAgentSessionRecord {
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    linearConnectionId: row.linear_connection_id,
+    linearOrganizationId: row.linear_organization_id,
+    linearSessionId: row.linear_session_id,
+    issueId: row.issue_id,
+    issueIdentifier: row.issue_identifier,
+    teamId: row.team_id,
+    projectId: row.project_id,
+    agentSessionId: row.agent_session_id,
+    currentExecutionId: row.current_execution_id,
+    daemonId: row.daemon_id,
+    daemonAgentId: row.daemon_agent_id,
+    daemonWorkspaceId: row.daemon_workspace_id,
+    mirrorStatus: linearMirrorStatus(row.mirror_status),
+    respondedAt: row.responded_at,
+    lastActivityId: row.last_activity_id,
+    lastActivityAt: row.last_activity_at,
+    lastAssistantMessage: row.last_assistant_message,
+    pullRequestUrl: row.pull_request_url,
+    pendingPermission: linearPendingPermission(row.pending_permission),
+    pendingPrompts: linearPendingPrompts(row.pending_prompts),
+    stopRequestedAt: row.stop_requested_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 function isDaemonSlugConflict(error: unknown): boolean {

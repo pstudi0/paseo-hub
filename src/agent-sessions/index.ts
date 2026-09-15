@@ -102,6 +102,7 @@ export class AgentSessions {
           projectId: input.intent.projectId,
           organizationId: input.intent.organizationId,
           continuationKey,
+          workspaceKey: null,
           daemonId: input.intent.environment.daemonId,
           agentId: null,
           workspaceId: null,

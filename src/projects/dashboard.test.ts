@@ -43,6 +43,7 @@ describe("project dashboard activity read models", () => {
             refreshToken: null,
             accessTokenExpiresAt: new Date("2000-01-01T00:00:00.000Z"),
             scopes: ["read", "comments:create"],
+            teamAccess: null,
           },
           {
             id: "refreshable",
@@ -56,6 +57,7 @@ describe("project dashboard activity read models", () => {
             refreshToken: "refresh-token",
             accessTokenExpiresAt: new Date("2000-01-01T00:00:00.000Z"),
             scopes: ["read", "comments:create"],
+            teamAccess: null,
           },
         ],
       });

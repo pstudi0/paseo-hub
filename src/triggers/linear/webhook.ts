@@ -21,7 +21,8 @@ export interface LinearWebhookSourceOptions {
   }): Promise<LinearIssueDetails | undefined>;
   accept(input: {
     linearOrganizationId: string;
-    projectId?: string;
+    /** Route selector persisted as the receipt `resource_id` (the Linear project for issues). */
+    resourceId?: string;
     deliveryId: string;
     signatureHash: string;
     source: string;
@@ -153,10 +154,10 @@ async function acceptAndDispatchLinearEvent(
   options: LinearWebhookSourceOptions,
   preserveBindingDrop = false,
 ): Promise<Response> {
-  const projectId = eventProjectId(event);
+  const resourceId = eventProjectId(event);
   const acceptance = await options.accept({
     linearOrganizationId: event.organizationId,
-    ...(projectId === undefined ? {} : { projectId }),
+    ...(resourceId === undefined ? {} : { resourceId }),
     deliveryId: verified.deliveryId,
     signatureHash: verified.signatureHash,
     source,
@@ -170,7 +171,7 @@ async function acceptAndDispatchLinearEvent(
     provider: "linear",
     source,
     deliveryId: verified.deliveryId,
-    resourceId: projectId,
+    resourceId,
     acceptance,
   });
   const events = acceptance.status === "accepted" ? acceptance.events : [];

@@ -37,6 +37,7 @@ const linear: LinearConnectionRecord = {
   refreshToken: "refresh-token",
   accessTokenExpiresAt: null,
   scopes: ["read", "comments:create"],
+  teamAccess: null,
 };
 
 describe("ProjectConfigurationStore resource compilation", () => {
@@ -197,7 +198,7 @@ describe("ProjectConfigurationStore resource compilation", () => {
 
     const accepted = await database.acceptLinearEvent({
       linearOrganizationId: linear.linearOrganizationId,
-      projectId: "linear-project-1",
+      resourceId: "linear-project-1",
       deliveryId: "linear-scout-entry",
       source: "linear.issue",
       payload: {},
@@ -212,7 +213,7 @@ describe("ProjectConfigurationStore resource compilation", () => {
         : undefined;
     const underScoped = await database.acceptLinearEvent({
       linearOrganizationId: linear.linearOrganizationId,
-      projectId: "linear-project-1",
+      resourceId: "linear-project-1",
       deliveryId: "linear-scout-under-scoped",
       source: "linear.issue",
       payload: {},
@@ -234,7 +235,7 @@ describe("ProjectConfigurationStore resource compilation", () => {
         : undefined;
     const expired = await database.acceptLinearEvent({
       linearOrganizationId: linear.linearOrganizationId,
-      projectId: "linear-project-1",
+      resourceId: "linear-project-1",
       deliveryId: "linear-scout-expired",
       source: "linear.issue",
       payload: {},

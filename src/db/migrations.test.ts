@@ -79,4 +79,33 @@ describe("database migrations", () => {
     assert.match(migration, /WHERE EXISTS \(SELECT 1 FROM "user"\)/u);
     assert.match(migration, /DELETE FROM "organization_connection_attempts"/u);
   });
+
+  it("mirrors Linear agent sessions without backfilling existing rows", () => {
+    const migration = readFileSync(
+      join(here, "../../drizzle/0049_linear_agent_sessions.sql"),
+      "utf8",
+    );
+    assert.match(migration, /CREATE TABLE "linear_agent_sessions"/u);
+    assert.match(
+      migration,
+      /CONSTRAINT "linear_agent_sessions_mirror_status_check" CHECK \([\s\S]*'pending', 'active', 'awaitingInput', 'complete', 'error', 'stale'/u,
+    );
+    assert.match(migration, /ALTER TABLE "agent_sessions" ADD COLUMN "workspace_key" text/u);
+    assert.match(
+      migration,
+      /ALTER TABLE "agent_sessions" ADD COLUMN "created_at" timestamp with time zone DEFAULT now\(\) NOT NULL/u,
+    );
+    assert.match(migration, /ALTER TABLE "linear_connections" ADD COLUMN "team_access" jsonb/u);
+    assert.match(
+      migration,
+      /"linear_agent_sessions_connection_organization_fk" FOREIGN KEY \("linear_connection_id","organization_id"\) REFERENCES "public"\."linear_connections"\("id","organization_id"\) ON DELETE cascade/u,
+    );
+    assert.match(migration, /CREATE UNIQUE INDEX "linear_agent_sessions_linear_session_unique"/u);
+    assert.match(
+      migration,
+      /CREATE INDEX "linear_agent_sessions_linear_organization_issue_idx" ON "linear_agent_sessions" USING btree \("linear_organization_id","issue_id"\)/u,
+    );
+    assert.match(migration, /CREATE INDEX "agent_sessions_project_workspace_key_idx"/u);
+    assert.doesNotMatch(migration, /^(?:UPDATE|INSERT|DELETE) /mu);
+  });
 });

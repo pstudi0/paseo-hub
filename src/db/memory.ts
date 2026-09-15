@@ -61,6 +61,13 @@ import type {
   DiscordConnectionRecord,
   SlackConnectionRecord,
   LinearConnectionRecord,
+  LinearAgentSessionPatch,
+  LinearAgentSessionRecord,
+  LinearLifecycleReceiptClaim,
+  LinearLifecycleReceiptClaimInput,
+  LinearLifecycleResult,
+  LinearPendingPrompt,
+  UpsertLinearAgentSessionInput,
   GitHubRepositoryRecord,
   OrganizationConnectionUsage,
   ProjectTriggerRoute,
@@ -124,6 +131,7 @@ export interface MemoryDatabaseOptions {
   }[];
   now?: () => Date;
   slackConnections?: readonly SlackConnectionRecord[];
+  linearConnections?: readonly LinearConnectionRecord[];
 }
 
 function usageKey(organizationId: string, meter: string, periodStart: Date): string {
@@ -223,6 +231,9 @@ class MemoryDatabase implements Database {
     this.organizationIds = new Set(options.organizationIds);
     for (const connection of options.slackConnections ?? []) {
       this.slackConnections.set(connection.teamId, connection);
+    }
+    for (const connection of options.linearConnections ?? []) {
+      this.linearConnections.set(connection.linearOrganizationId, connection);
     }
   }
 
@@ -1076,7 +1087,7 @@ class MemoryDatabase implements Database {
       input,
       binding?.organizationId,
       binding?.id,
-      input.projectId ?? null,
+      input.resourceId ?? null,
       reason,
     );
   }
@@ -1218,6 +1229,70 @@ class MemoryDatabase implements Database {
     );
     if (receipt.signatureHash !== null)
       this.providerEventReceiptIdsBySignature.delete(receipt.signatureHash);
+    return Promise.resolve();
+  }
+
+  async claimLinearLifecycleReceipt(
+    input: LinearLifecycleReceiptClaimInput,
+  ): Promise<LinearLifecycleReceiptClaim> {
+    const connection = this.linearConnections.get(input.linearOrganizationId);
+    if (connection === undefined) return { status: "unbound" };
+    const existing = this.findReceiptId(
+      connection.organizationId,
+      input.deliveryId,
+      input.signatureHash,
+    );
+    if (existing !== undefined) {
+      return { status: "duplicate", providerEventReceiptId: existing };
+    }
+    const receipt = this.insertProviderEventReceipt({
+      organizationId: connection.organizationId,
+      provider: "linear",
+      connectionId: connection.id,
+      resourceId: null,
+      input: { ...input, dropReason: "linear_lifecycle" },
+    });
+    return {
+      status: "claimed",
+      providerEventReceiptId: receipt.id,
+      connectionId: connection.id,
+      organizationId: connection.organizationId,
+      linearOrganizationId: input.linearOrganizationId,
+    };
+  }
+
+  async applyLinearLifecycle(
+    claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
+    result: LinearLifecycleResult,
+  ): Promise<void> {
+    if (result.kind === "noop") return;
+    const evidence = this.providerEventReceipts.get(claim.providerEventReceiptId);
+    if (evidence?.droppedReason !== "linear_lifecycle") return;
+    await this.withAdvisoryLock(
+      JSON.stringify(["paseo-connection", "linear", "external", claim.linearOrganizationId]),
+      async () => {
+        const connection = this.linearConnections.get(claim.linearOrganizationId);
+        if (connection?.id !== claim.connectionId) return;
+        this.linearConnections.set(
+          claim.linearOrganizationId,
+          result.kind === "revoked"
+            ? { ...connection, refreshToken: null, accessTokenExpiresAt: new Date(0) }
+            : { ...connection, teamAccess: structuredClone(result.teamAccess) },
+        );
+      },
+    );
+  }
+
+  releaseLinearLifecycleReceipt(providerEventReceiptId: string): Promise<void> {
+    const receipt = this.providerEventReceipts.get(providerEventReceiptId);
+    if (receipt?.droppedReason !== "linear_lifecycle") return Promise.resolve();
+    this.providerEventReceipts.delete(providerEventReceiptId);
+    this.providerEventReceiptIdsByDelivery.delete(
+      triggerDeliveryKey(receipt.organizationId, receipt.deliveryId),
+    );
+    if (receipt.signatureHash !== null) {
+      this.providerEventReceiptIdsBySignature.delete(receipt.signatureHash);
+    }
     return Promise.resolve();
   }
 
@@ -2293,14 +2368,21 @@ class MemoryDatabase implements Database {
     import("../agent-sessions/index.js").AgentSessionRecord
   >();
   async findAgentSession(id: string) {
-    return structuredClone(this.agentSessions.get(id));
+    const session = this.agentSessions.get(id);
+    return session === undefined ? undefined : cloneAgentSession(session);
   }
   async findAgentSessionByKey(projectId: string, key: string) {
-    return structuredClone(
-      [...this.agentSessions.values()].find(
-        (session) => session.projectId === projectId && session.continuationKey === key,
-      ),
+    const session = [...this.agentSessions.values()].find(
+      (candidate) => candidate.projectId === projectId && candidate.continuationKey === key,
     );
+    return session === undefined ? undefined : cloneAgentSession(session);
+  }
+  /** Most recently saved first: the Map keeps insertion order, so it is walked backwards. */
+  async findAgentSessionsByWorkspaceKey(projectId: string, workspaceKey: string) {
+    return [...this.agentSessions.values()]
+      .toReversed()
+      .filter((session) => session.projectId === projectId && session.workspaceKey === workspaceKey)
+      .map(cloneAgentSession);
   }
   async saveAgentSession(
     session: import("../agent-sessions/index.js").AgentSessionRecord,
@@ -2333,6 +2415,137 @@ class MemoryDatabase implements Database {
     return [...this.agentExecutions.values()].filter(
       (execution) => execution.agentSessionId === sessionId,
     );
+  }
+
+  /** Keyed by Linear session id; every read returns a clone, every write happens synchronously. */
+  private readonly linearAgentSessions = new Map<string, LinearAgentSessionRecord>();
+
+  async upsertLinearAgentSession(
+    input: UpsertLinearAgentSessionInput,
+  ): Promise<{ record: LinearAgentSessionRecord; created: boolean }> {
+    const existing = this.linearAgentSessions.get(input.linearSessionId);
+    if (existing !== undefined) return { record: structuredClone(existing), created: false };
+    const now = this.now();
+    const record: LinearAgentSessionRecord = {
+      id: randomUUID(),
+      organizationId: input.organizationId,
+      linearConnectionId: input.linearConnectionId,
+      linearOrganizationId: input.linearOrganizationId,
+      linearSessionId: input.linearSessionId,
+      issueId: input.issueId,
+      issueIdentifier: input.issueIdentifier ?? null,
+      teamId: input.teamId,
+      projectId: null,
+      agentSessionId: null,
+      currentExecutionId: null,
+      daemonId: null,
+      daemonAgentId: null,
+      daemonWorkspaceId: null,
+      mirrorStatus: "pending",
+      respondedAt: null,
+      lastActivityId: null,
+      lastActivityAt: null,
+      lastAssistantMessage: null,
+      pullRequestUrl: null,
+      pendingPermission: null,
+      pendingPrompts: [],
+      stopRequestedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.linearAgentSessions.set(record.linearSessionId, record);
+    return { record: structuredClone(record), created: true };
+  }
+
+  async findLinearAgentSession(
+    linearSessionId: string,
+  ): Promise<LinearAgentSessionRecord | undefined> {
+    return structuredClone(this.linearAgentSessions.get(linearSessionId));
+  }
+
+  async listLinearAgentSessionsForIssue(
+    linearOrganizationId: string,
+    issueId: string,
+  ): Promise<LinearAgentSessionRecord[]> {
+    return [...this.linearAgentSessions.values()]
+      .filter(
+        (session) =>
+          session.linearOrganizationId === linearOrganizationId && session.issueId === issueId,
+      )
+      .sort(
+        (left, right) =>
+          right.createdAt.getTime() - left.createdAt.getTime() || right.id.localeCompare(left.id),
+      )
+      .map((session) => structuredClone(session));
+  }
+
+  async updateLinearAgentSession(
+    linearSessionId: string,
+    patch: LinearAgentSessionPatch,
+  ): Promise<LinearAgentSessionRecord | undefined> {
+    const current = this.linearAgentSessions.get(linearSessionId);
+    if (current === undefined) return undefined;
+    const updated: LinearAgentSessionRecord = {
+      ...current,
+      ...(patch.projectId === undefined ? {} : { projectId: patch.projectId }),
+      ...(patch.agentSessionId === undefined ? {} : { agentSessionId: patch.agentSessionId }),
+      ...(patch.currentExecutionId === undefined
+        ? {}
+        : { currentExecutionId: patch.currentExecutionId }),
+      ...(patch.daemonId === undefined ? {} : { daemonId: patch.daemonId }),
+      ...(patch.daemonAgentId === undefined ? {} : { daemonAgentId: patch.daemonAgentId }),
+      ...(patch.daemonWorkspaceId === undefined
+        ? {}
+        : { daemonWorkspaceId: patch.daemonWorkspaceId }),
+      ...(patch.mirrorStatus === undefined ? {} : { mirrorStatus: patch.mirrorStatus }),
+      ...(patch.respondedAt === undefined ? {} : { respondedAt: patch.respondedAt }),
+      ...(patch.lastActivityId === undefined ? {} : { lastActivityId: patch.lastActivityId }),
+      ...(patch.lastActivityAt === undefined ? {} : { lastActivityAt: patch.lastActivityAt }),
+      ...(patch.lastAssistantMessage === undefined
+        ? {}
+        : { lastAssistantMessage: patch.lastAssistantMessage }),
+      ...(patch.pullRequestUrl === undefined ? {} : { pullRequestUrl: patch.pullRequestUrl }),
+      ...(patch.pendingPermission === undefined
+        ? {}
+        : { pendingPermission: structuredClone(patch.pendingPermission) }),
+      ...(patch.stopRequestedAt === undefined ? {} : { stopRequestedAt: patch.stopRequestedAt }),
+      updatedAt: this.now(),
+    };
+    this.linearAgentSessions.set(linearSessionId, updated);
+    return structuredClone(updated);
+  }
+
+  async appendLinearPendingPrompt(
+    linearSessionId: string,
+    prompt: LinearPendingPrompt,
+  ): Promise<LinearAgentSessionRecord | undefined> {
+    const current = this.linearAgentSessions.get(linearSessionId);
+    if (current === undefined) return undefined;
+    const updated: LinearAgentSessionRecord = {
+      ...current,
+      pendingPrompts: [...current.pendingPrompts, structuredClone(prompt)],
+      updatedAt: this.now(),
+    };
+    this.linearAgentSessions.set(linearSessionId, updated);
+    return structuredClone(updated);
+  }
+
+  async takeLinearPendingPrompts(linearSessionId: string): Promise<LinearPendingPrompt[]> {
+    // No await between the read and the write: the take is atomic like the single statement.
+    const current = this.linearAgentSessions.get(linearSessionId);
+    if (current === undefined) return [];
+    const taken = [...current.pendingPrompts];
+    this.linearAgentSessions.set(linearSessionId, {
+      ...current,
+      pendingPrompts: [],
+      updatedAt: this.now(),
+    });
+    return structuredClone(taken);
+  }
+
+  async findOrganizationSlug(organizationId: string): Promise<string | undefined> {
+    return this.operatorOrganizations().find((organization) => organization.id === organizationId)
+      ?.slug;
   }
 
   async withAdvisoryLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -3434,6 +3647,13 @@ function slackDropReason(
   if (input.dropReason !== undefined) return input.dropReason;
   if (binding === undefined) return "slack_unbound";
   return undefined;
+}
+
+/** Sessions saved before `workspaceKey` existed read back with `null`, as in Postgres. */
+function cloneAgentSession(
+  session: import("../agent-sessions/index.js").AgentSessionRecord,
+): import("../agent-sessions/index.js").AgentSessionRecord {
+  return { ...structuredClone(session), workspaceKey: session.workspaceKey ?? null };
 }
 
 function linearDropReason(
