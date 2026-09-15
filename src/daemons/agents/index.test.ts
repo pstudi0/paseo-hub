@@ -328,6 +328,79 @@ describe("respondToPermission", () => {
     agents.close();
   });
 
+  test("a streamed confirmation releases the correlated request and its timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const { agents, requests } = channel(() => undefined);
+      const outcome = agents.respondToPermission("agent", "perm-1", response);
+      agents.receive({
+        type: "session",
+        message: {
+          type: "agent_stream",
+          payload: {
+            agentId: "agent",
+            timestamp: "2026-01-01T00:00:00.000Z",
+            event: {
+              type: "permission_resolved",
+              provider: "codex",
+              requestId: "perm-1",
+              resolution: response,
+            },
+          },
+        },
+      });
+      expect(await outcome).toBe("resolved");
+      expect(vi.getTimerCount()).toBe(0);
+      // The daemon's late reply for the forgotten request is not claimed.
+      expect(
+        agents.receive({
+          type: "session",
+          message: {
+            type: "agent_permission_resolved",
+            payload: { agentId: "agent", requestId: "perm-1", resolution: response },
+          },
+        }),
+      ).toBe(false);
+      // The permission can be answered again once nothing is in flight.
+      const again = agents.respondToPermission("agent", "perm-1", response);
+      expect(requests).toHaveLength(2);
+      agents.receive({
+        type: "session",
+        message: {
+          type: "agent_permission_resolved",
+          payload: { agentId: "agent", requestId: "perm-1", resolution: response },
+        },
+      });
+      expect(await again).toBe("resolved");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("refuses a second answer while the first is still in flight", async () => {
+    vi.useFakeTimers();
+    try {
+      const { agents, requests } = channel(() => undefined);
+      const first = agents.respondToPermission("agent", "perm-1", response);
+      await expect(agents.respondToPermission("agent", "perm-1", response)).rejects.toThrow(
+        "Permission answer already in flight: perm-1",
+      );
+      expect(requests).toHaveLength(1);
+      agents.receive({
+        type: "session",
+        message: {
+          type: "agent_permission_resolved",
+          payload: { agentId: "agent", requestId: "perm-1", resolution: response },
+        },
+      });
+      expect(await first).toBe("resolved");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("surfaces the daemon's refusal with its code", async () => {
     const { agents } = channel((message) => {
       agents.receive({

@@ -54,7 +54,11 @@ class TestAgents implements AgentConnection {
   async watch() {
     return () => {};
   }
+  /** Mirrors the daemon channel: a live workspace has nothing to restore. */
   async restore(workspaceId: string) {
+    const state = this.workspaces.get(workspaceId);
+    if (state?.kind === "active") return false;
+    if (state?.kind !== "archived") throw new Error(`Workspace ${workspaceId} cannot be restored`);
     this.restorations++;
     this.workspaces.set(workspaceId, { kind: "active" });
     for (const [id, agent] of this.agents)
@@ -83,6 +87,11 @@ class TestAgents implements AgentConnection {
       for (const [id, agent] of this.agents)
         if (agent.workspaceId === workspaceId)
           this.agents.set(id, { ...agent, archivedAt: new Date().toISOString() });
+    }
+    if (action === "archive_agent") {
+      // The agent alone is archived; its workspace stays live for the sibling sessions.
+      const agent = this.agents.get(agentId);
+      if (agent) this.agents.set(agentId, { ...agent, archivedAt: new Date().toISOString() });
     }
   }
 }
@@ -148,12 +157,13 @@ async function fixture(now = Date.now) {
     });
     return {
       executionId,
-      dispatch: () =>
+      dispatch: (onAgentReady?: (agent: { agentId: string; workspaceId: string }) => void) =>
         sessions.dispatch({
           executionId,
           intent,
           connection,
           onEvent: () => {},
+          ...(onAgentReady === undefined ? {} : { onAgentReady }),
           createOptions: async () => ({
             provider: "codex",
             cwd: "/repo",
@@ -533,6 +543,42 @@ test("every session of a workspace key serializes on the workspace lock, in disp
   expect(control).toBe(dispatchOne);
   expect(release).toBe(dispatchOne);
   expect(locks).toHaveLength(5);
+});
+
+test("the agent is announced before its prompt is delivered", async () => {
+  const f = await fixture();
+  const first = await f.arrival();
+  const seen: { agentId: string; workspaceId: string; deliveries: number }[] = [];
+  const dispatched = await first.dispatch((agent) => {
+    seen.push({ ...agent, deliveries: f.connection.deliveries.length });
+  });
+  expect(seen).toEqual([
+    { agentId: dispatched.agentId, workspaceId: dispatched.workspaceId, deliveries: 0 },
+  ]);
+  expect(f.connection.deliveries).toHaveLength(1);
+});
+
+test("a session whose agent alone was archived reuses its live workspace without restoring it", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  const opened = await first.dispatch();
+  const second = await f.issueArrival("linear:session:2");
+  await second.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  await f.sessions.control(await f.execution(first.executionId), f.connection, "archive");
+  expect(f.connection.actions).toEqual(["archive_agent"]);
+  expect((await f.connection.get(opened.agentId)).archivedAt).toEqual(expect.any(String));
+
+  const again = await f.issueArrival("linear:session:1");
+  const resumed = await again.dispatch();
+  expect(resumed).toMatchObject({
+    agentId: opened.agentId,
+    workspaceId: opened.workspaceId,
+    action: "restored",
+    workspace: { action: "reused" },
+  });
+  expect(f.connection.creates).toHaveLength(2);
+  expect(f.connection.restorations).toBe(0);
 });
 
 test("archiving a finished issue session keeps the workspace while a sibling session still works", async () => {

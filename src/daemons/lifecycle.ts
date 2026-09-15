@@ -1719,6 +1719,7 @@ export class DaemonDispatchLifecycle implements ExecutionControl {
   }): Promise<string> {
     const connection = this.options.connectionForDaemon(input.daemonId);
     if (!connection) throw new DaemonDispatchFailure("daemon_unreachable");
+    const provider = this.findProviderForTriggerContext(input.intent.triggerContext);
     const dispatched = await this.sessionOwner()
       .dispatch({
         executionId: input.executionId,
@@ -1731,8 +1732,19 @@ export class DaemonDispatchLifecycle implements ExecutionControl {
             },
           ),
         onEvent: (event) => this.observeSessionEvent(input.executionId, input.daemonId, event),
+        // The daemon streams `turn_started` before it acknowledges the prompt: observe first.
+        onAgentReady: (agent) =>
+          this.observeExecutionStream(
+            input.executionId,
+            provider,
+            input.intent,
+            input.daemonId,
+            agent.agentId,
+          ),
       })
       .catch(async (error: unknown) => {
+        // The observer may already be registered when delivery fails after the agent is bound.
+        this.streamObservers.delete(input.executionId);
         const execution = await this.options.database.findAgentExecutionById(input.executionId);
         if (execution && isTerminalExecutionStatus(execution.status)) {
           await this.reconcileHubActionSafely(execution);
@@ -1741,14 +1753,6 @@ export class DaemonDispatchLifecycle implements ExecutionControl {
       });
     this.executionSubscriptions.get(input.executionId)?.();
     this.executionSubscriptions.set(input.executionId, dispatched.unsubscribe);
-    const provider = this.findProviderForTriggerContext(input.intent.triggerContext);
-    this.observeExecutionStream(
-      input.executionId,
-      provider,
-      input.intent,
-      input.daemonId,
-      dispatched.agentId,
-    );
     await this.startAgentExecution(input.executionId);
     await this.armLiveExecutionDeadline(input.executionId);
     if (provider !== undefined) {

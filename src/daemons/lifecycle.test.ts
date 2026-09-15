@@ -647,6 +647,22 @@ describe("execution control and provider stream observation", () => {
     }
   });
 
+  it("forwards the turn start the daemon streams before acknowledging the prompt", async () => {
+    const fixture = await dispatchedFixture({ streamTurnStartBeforeAck: true });
+    try {
+      assert.deepEqual(fixture.connection.sends, [
+        { agentId: AGENT_ID, messageId: EXECUTION_ID, text: "Work on the issue" },
+      ]);
+      assert.deepEqual(
+        fixture.streamed.map((item) => [item.executionId, item.agentId, item.event.type]),
+        [[EXECUTION_ID, AGENT_ID, "turn_started"]],
+      );
+      assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 1);
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+
   it("provider stream hook failure is reported, not fatal", async () => {
     const canary = "linear-mirror-secret-7d21";
     const fixture = await dispatchedFixture({ streamFailure: canary });
@@ -870,11 +886,22 @@ class ControlConnection implements DaemonConnection {
   pendingPermissions: { id: string }[] = [];
   pullRequest: { url: string; title: string } | undefined;
   answer: () => "resolved" | "unconfirmed" = () => "resolved";
+  /** Like the daemon, stream the turn's start before acknowledging the prompt. */
+  streamTurnStartBeforeAck = false;
   private readonly listeners = new Set<(event: AgentEvent) => void>();
   readonly agents: AgentConnection = {
     create: async () => this.snapshot(),
     get: async () => this.snapshot(),
     send: async (agentId, messageId, text) => {
+      if (this.streamTurnStartBeforeAck) {
+        this.emit({
+          type: "agent_stream",
+          agentId,
+          event: { type: "turn_started", provider: "codex" },
+          timestamp: ACKNOWLEDGED_AT.toISOString(),
+        });
+        await settle();
+      }
       this.sends.push({ agentId, messageId, text });
     },
     restore: async () => true,
@@ -918,11 +945,16 @@ class ControlConnection implements DaemonConnection {
 }
 
 async function dispatchedFixture(
-  options: { streamFailure?: string; dispatchFailure?: string } = {},
+  options: {
+    streamFailure?: string;
+    dispatchFailure?: string;
+    streamTurnStartBeforeAck?: boolean;
+  } = {},
 ) {
   const database = createMemoryDatabase();
   const stream = new FailureLogStream();
   const connection = new ControlConnection();
+  connection.streamTurnStartBeforeAck = options.streamTurnStartBeforeAck ?? false;
   const dispatched: AgentDispatchNotification[] = [];
   const streamed: AgentStreamNotification[] = [];
   /** The stream hook waits on this before returning, so a test can hold it open. */

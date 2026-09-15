@@ -279,12 +279,16 @@ export class DaemonAgents implements AgentConnection {
    * The daemon correlates its answer on this frame's `requestId`: `agent_permission_resolved`
    * (modern sockets) or `rpc_error` on refusal, and every socket also streams `permission_resolved`
    * for the agent. Either confirmation resolves; silence past the deadline is "unconfirmed".
+   * One answer per permission is in flight at a time: the frame is correlated on the permission
+   * id, so a second concurrent answer could not be told apart from the first.
    */
   async respondToPermission(
     agentId: string,
     requestId: string,
     response: AgentPermissionResponse,
   ): Promise<"resolved" | "unconfirmed"> {
+    if (this.pending.has(requestId))
+      throw new DaemonAgentError(`Permission answer already in flight: ${requestId}`);
     let unlisten = (): void => {};
     const observed = new Promise<"resolved">((resolve) => {
       unlisten = this.listen(agentId, (event) => {
@@ -296,11 +300,12 @@ export class DaemonAgents implements AgentConnection {
           resolve("resolved");
       });
     });
-    const replied = this.request(
+    const sent = this.correlate(
       { type: "agent_permission_response", agentId, requestId, response },
       PERMISSION_CONFIRM_MS,
       requestId,
-    ).then(
+    );
+    const replied = sent.result.then(
       () => "resolved" as const,
       (error: unknown) => {
         if (error instanceof DaemonResponseLostError) return "unconfirmed" as const;
@@ -313,6 +318,8 @@ export class DaemonAgents implements AgentConnection {
       return await Promise.race([observed, replied]);
     } finally {
       unlisten();
+      // Whichever confirmation won, the daemon owes nothing more on this request id.
+      sent.forget();
     }
   }
   async watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void> {
@@ -353,21 +360,48 @@ export class DaemonAgents implements AgentConnection {
     timeoutMs = 30_000,
     requestId: string = randomUUID(),
   ): Promise<Record<string, unknown>> {
-    if (!this.supported) throw new DaemonAgentError("Update the Paseo daemon to run Hub agents");
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
-        this.pending.set(requestId, { resolve, reject });
-        timeout = setTimeout(() => reject(new DaemonResponseLostError()), timeoutMs);
-        this.sendFrame(JSON.stringify({ type: "session", message: { ...message, requestId } }));
-      });
-      const parsed = ResultSchema.parse(result);
-      if (parsed.error || parsed.accepted === false)
-        throw new DaemonAgentError(parsed.error ?? "Daemon request rejected");
-      return result;
-    } finally {
-      clearTimeout(timeout);
-      this.pending.delete(requestId);
+    return this.correlate(message, timeoutMs, requestId).result;
+  }
+  /**
+   * Sends a correlated request. `result` settles on the daemon's reply or the timeout; `forget`
+   * drops the correlation and its timer early, after which the reply is ignored and `result`
+   * never settles. A `requestId` already in flight is refused rather than silently replaced.
+   */
+  private correlate(
+    message: Record<string, unknown>,
+    timeoutMs: number,
+    requestId: string,
+  ): { result: Promise<Record<string, unknown>>; forget: () => void } {
+    if (!this.supported) {
+      return {
+        result: Promise.reject(new DaemonAgentError("Update the Paseo daemon to run Hub agents")),
+        forget: () => {},
+      };
     }
+    if (this.pending.has(requestId)) {
+      return {
+        result: Promise.reject(new DaemonAgentError(`Request already in flight: ${requestId}`)),
+        forget: () => {},
+      };
+    }
+    let forget = (): void => {};
+    const result = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new DaemonResponseLostError()), timeoutMs);
+      const entry = { resolve, reject };
+      forget = () => {
+        clearTimeout(timeout);
+        if (this.pending.get(requestId) === entry) this.pending.delete(requestId);
+      };
+      this.pending.set(requestId, entry);
+      this.sendFrame(JSON.stringify({ type: "session", message: { ...message, requestId } }));
+    })
+      .finally(forget)
+      .then((raw) => {
+        const parsed = ResultSchema.parse(raw);
+        if (parsed.error || parsed.accepted === false)
+          throw new DaemonAgentError(parsed.error ?? "Daemon request rejected");
+        return raw;
+      });
+    return { result, forget: () => forget() };
   }
 }

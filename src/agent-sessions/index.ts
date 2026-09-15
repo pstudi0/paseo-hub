@@ -59,6 +59,12 @@ export class AgentSessions {
     connection: AgentConnection;
     createOptions: () => Promise<DaemonCreateAgentOptions>;
     onEvent: (event: AgentEvent) => void;
+    /**
+     * Called once the agent is bound to the execution and before the prompt is delivered: the
+     * daemon streams the turn's first events before it acknowledges the send, so anything that
+     * must see them has to be listening by now.
+     */
+    onAgentReady?: (agent: { agentId: string; workspaceId: string }) => void;
   }): Promise<AgentSessionDispatchResult> {
     const incoming = await this.database.findAgentExecutionById(input.executionId);
     if (!incoming || !isActive(incoming)) throw new AgentSessionError("execution_terminal");
@@ -134,6 +140,10 @@ export class AgentSessions {
         materialized.agentId,
       );
       await this.database.attachExecutionToSession(input.executionId, id, materialized.action);
+      input.onAgentReady?.({
+        agentId: materialized.agentId,
+        workspaceId: materialized.workspaceId,
+      });
       const unsubscribe = await this.deliver(input, materialized.agentId, startupTimeoutMs);
       return {
         agentId: materialized.agentId,
@@ -237,9 +247,11 @@ export class AgentSessions {
       throw new AgentSessionError("agent_interrupted");
     }
     if (agent.archivedAt) {
-      await connection.restore(session.workspaceId, startupTimeoutMs);
+      // An agent archived on its own (`archive_agent`) leaves the workspace live: nothing to
+      // restore, the daemon un-archives the agent when the prompt lands.
+      const restored = await connection.restore(session.workspaceId, startupTimeoutMs);
       action = "restored";
-      workspace = { action: "restored" };
+      workspace = { action: restored ? "restored" : "reused" };
     }
     return {
       session,
