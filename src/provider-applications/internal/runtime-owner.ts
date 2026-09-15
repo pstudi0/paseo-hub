@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import type { GitHubConfigurationProvider } from "../../configuration/github-sync.js";
 import type { Database } from "../../db/types.js";
 import { replyOutputTool } from "../../execution-capabilities/outputs.js";
+import { LINEAR_OUTPUT_TYPES, linearOutputTool } from "../../triggers/linear/agent-outputs.js";
+import type { LinearSessionState } from "../../triggers/linear/session-state.js";
 import { logger } from "../../logger.js";
 import { reportFailure } from "../../failures/index.js";
 import { createDiscordRegistration } from "../../providers/discord/index.js";
@@ -68,6 +70,8 @@ interface DynamicProviderRuntimeOptions {
   applicationBaseUrl: string;
   /** Shared by every activation: registrations rebuilt on reconfiguration keep the same control. */
   executionControl: ExecutionControl;
+  /** Linear agent-session queues and caches that outlive one registration. */
+  linearSessionState?: LinearSessionState;
   fetch?: typeof fetch;
   registrationFactory?: (input: {
     provider: Provider;
@@ -234,6 +238,10 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       executionControl: this.options.executionControl,
       ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
     };
+    const linearShared =
+      this.options.linearSessionState === undefined
+        ? {}
+        : { sessionState: this.options.linearSessionState };
     if (provider === "github" && configuration.provider === "github") {
       return createGitHubRegistration({ ...shared, configuration });
     }
@@ -261,6 +269,7 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
     if (provider === "linear" && configuration.provider === "linear") {
       return createLinearRegistration({
         ...shared,
+        ...linearShared,
         configuration,
         ...(activation?.expectedConfigurationVersion === undefined
           ? {}
@@ -403,28 +412,24 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
         },
       ],
       sources: [source],
-      outputs: [
-        {
-          type: `${provider}.reply`,
-          tool: replyOutputTool,
-          available: (context) => {
-            const output = slot.active?.registration.outputs.find(
-              (candidate) => candidate.type === `${provider}.reply`,
-            );
-            return output !== undefined && (output.available?.(context) ?? true);
-          },
-          execute: (input) => {
-            const active = slot.active;
-            const output = active?.registration.outputs.find(
-              (candidate) => candidate.type === `${provider}.reply`,
-            );
-            if (active === undefined || output === undefined) {
-              throw unavailable(`${provider}_output_unavailable`);
-            }
-            return this.withLease(active, () => output.execute(input));
-          },
+      outputs: outputTypes(provider).map((type) => ({
+        type,
+        tool: linearOutputTool(type) ?? replyOutputTool,
+        available: (context) => {
+          const output = slot.active?.registration.outputs.find(
+            (candidate) => candidate.type === type,
+          );
+          return output !== undefined && (output.available?.(context) ?? true);
         },
-      ],
+        execute: (input) => {
+          const active = slot.active;
+          const output = active?.registration.outputs.find((candidate) => candidate.type === type);
+          if (active === undefined || output === undefined) {
+            throw unavailable(`${provider}_output_unavailable`);
+          }
+          return this.withLease(active, () => output.execute(input));
+        },
+      })),
       requests:
         provider === "discord"
           ? []
@@ -650,8 +655,12 @@ function actionNames(provider: Provider): readonly string[] {
 function eventNames(provider: Provider): TriggerProvider["eventNames"] {
   if (provider === "slack") return ["slack.mention"];
   if (provider === "discord") return ["discord.mention"];
-  if (provider === "linear") return ["linear.issue", "linear.comment"];
+  if (provider === "linear") return ["linear.issue", "linear.comment", "linear.agent_session"];
   return GITHUB_TRIGGER_SOURCE_NAMES;
+}
+
+function outputTypes(provider: Provider): readonly string[] {
+  return provider === "linear" ? LINEAR_OUTPUT_TYPES : [`${provider}.reply`];
 }
 
 async function startSources(active: ActiveRegistration, handler: TriggerHandler): Promise<void> {

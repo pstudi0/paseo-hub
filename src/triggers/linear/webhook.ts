@@ -1,12 +1,24 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { ProviderEventAcceptance } from "../../db/types.js";
+import type { DurableProviderEvent, ProviderEventAcceptance } from "../../db/types.js";
 import { readBoundedRequestBody } from "../../http/request-body.js";
+import { reportFailure } from "../../failures/index.js";
 import { logger } from "../../logger.js";
 import { logProviderEventIntake } from "../audit.js";
-import type { ProviderEventDropReasonCode } from "../drop-reason.js";
+import { isProviderEventDropReasonCode, type ProviderEventDropReasonCode } from "../drop-reason.js";
 import type { TriggerHandler, TriggerSource } from "../index.js";
-import { eventIssueId, eventRouteResourceId, normalizeLinearEvent } from "./events.js";
+import {
+  eventIssueId,
+  eventRouteResourceId,
+  normalizeLinearEvent,
+  type NormalizedLinearAgentSessionEvent,
+} from "./events.js";
+import { parseLinearLifecycleEvent, type LinearLifecycleEvent } from "./lifecycle-events.js";
+import type { LinearSessionCoordinator } from "./session-coordinator.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
+import type {
+  LinearLifecycleReceiptClaim,
+  LinearLifecycleReceiptClaimInput,
+} from "../../db/types.js";
 
 const MAX_WEBHOOK_BYTES = 1_048_576;
 const MAX_TIMESTAMP_SKEW_MS = 60_000;
@@ -30,6 +42,19 @@ export interface LinearWebhookSourceOptions {
     receivedAt: Date;
     dropReason?: ProviderEventDropReasonCode;
   }): Promise<ProviderEventAcceptance>;
+  /** Agent-session acknowledgement and follow-up routing; sessions are ignored without it. */
+  sessions?: Pick<
+    LinearSessionCoordinator,
+    "acknowledge" | "followUp" | "reportDrop" | "reportDispatchFailure"
+  >;
+  /** Permission changes, revocation and inbox notifications; ignored without it. */
+  lifecycle?: {
+    claim(input: LinearLifecycleReceiptClaimInput): Promise<LinearLifecycleReceiptClaim>;
+    apply(
+      event: LinearLifecycleEvent,
+      claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
+    ): Promise<void>;
+  };
 }
 
 export interface LinearWebhookEndpoint extends TriggerSource {
@@ -110,6 +135,8 @@ async function handoffLinearEvent(
   options: LinearWebhookSourceOptions,
 ): Promise<Response> {
   try {
+    const lifecycle = parseLinearLifecycleEvent(verified.eventName, verified.payload);
+    if (lifecycle !== undefined) return await applyLinearLifecycle(lifecycle, verified, options);
     let event = normalizeLinearEvent(verified.payload, verified.eventName);
     if (event === undefined) {
       logger.info({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
@@ -117,12 +144,20 @@ async function handoffLinearEvent(
     }
     // A session is routed by its issue's team; without an issue there is nothing to hydrate,
     // serve, or retry.
-    if (event.type === "agent_session" && event.session.issue === null) {
-      logger.info(
-        { deliveryId: verified.deliveryId, agentSessionId: event.session.id },
-        "ignoring Linear agent session without issue",
+    if (event.type === "agent_session") {
+      if (event.session.issue === null) {
+        logger.info(
+          { deliveryId: verified.deliveryId, agentSessionId: event.session.id },
+          "ignoring Linear agent session without issue",
+        );
+        return new Response("OK", { status: 200 });
+      }
+      return await acceptAndDispatchLinearSession(
+        { ...event, transportDeliveryId: verified.deliveryId },
+        verified,
+        handlers,
+        options,
       );
-      return new Response("OK", { status: 200 });
     }
     if (eventRouteResourceId(event) === undefined && options.resolveIssue !== undefined) {
       const source = linearEventSource(event);
@@ -187,6 +222,140 @@ async function acceptAndDispatchLinearEvent(
   await Promise.all(
     events.flatMap((acceptedEvent) => Array.from(handlers, (handler) => handler(acceptedEvent))),
   );
+  return new Response("OK", { status: 200 });
+}
+
+/**
+ * The agent-session path never awaits Linear or a daemon: Linear expects the HTTP answer within
+ * five seconds and the first activity within ten. Deduplication is by entity (`session.id` for
+ * `created`, `activity.id` for `prompted`) because every Linear retry is re-signed and re-stamped.
+ */
+async function acceptAndDispatchLinearSession(
+  event: NormalizedLinearAgentSessionEvent,
+  verified: VerifiedLinearRequest,
+  handlers: Set<TriggerHandler>,
+  options: LinearWebhookSourceOptions,
+): Promise<Response> {
+  const source = "linear.agent_session";
+  const resourceId = eventRouteResourceId(event);
+  const deliveryId =
+    event.action === "created"
+      ? `linear-agent-session:${event.session.id}`
+      : `linear-agent-activity:${event.id}`;
+  const acceptance = await options.accept({
+    linearOrganizationId: event.organizationId,
+    ...(resourceId === undefined ? {} : { resourceId }),
+    deliveryId,
+    signatureHash: verified.signatureHash,
+    source,
+    payload: event,
+    receivedAt: verified.receivedAt,
+    ...(handlers.size === 0 ? { dropReason: "configuration_unavailable" } : {}),
+  });
+  const followUp = await routeLinearSession(event, acceptance, options);
+  logProviderEventIntake({
+    provider: "linear",
+    source,
+    deliveryId,
+    resourceId,
+    acceptance,
+    transportDeliveryId: verified.deliveryId,
+    ...(followUp === undefined ? {} : { followUp }),
+  });
+  if (shouldDispatchLinearSession(event, acceptance, followUp)) {
+    await dispatchLinearSession(event, acceptance.events, handlers, options);
+  }
+  return new Response("OK", { status: 200 });
+}
+
+/** Acknowledges a new session or routes a follow-up; returns the follow-up outcome, if any. */
+async function routeLinearSession(
+  event: NormalizedLinearAgentSessionEvent,
+  acceptance: ProviderEventAcceptance,
+  options: LinearWebhookSourceOptions,
+): Promise<string | undefined> {
+  if (acceptance.status === "dropped") {
+    const reason = acceptance.reason;
+    if (isProviderEventDropReasonCode(reason)) options.sessions?.reportDrop(event, reason);
+    return undefined;
+  }
+  if (acceptance.status !== "accepted" || acceptance.replayed === true) return undefined;
+  const first = acceptance.events[0];
+  if (first === undefined || options.sessions === undefined) return undefined;
+  const input = { connectionId: first.connectionId ?? "", organizationId: first.organizationId };
+  if (event.action === "prompted") return options.sessions.followUp(event, input);
+  try {
+    await options.sessions.acknowledge(event, input);
+  } catch (error) {
+    reportFailure(error, {
+      component: "triggers",
+      operation: "linear.agent_session.acknowledge",
+      provider: "linear",
+    });
+  }
+  return undefined;
+}
+
+function shouldDispatchLinearSession(
+  event: NormalizedLinearAgentSessionEvent,
+  acceptance: ProviderEventAcceptance,
+  followUp: string | undefined,
+): acceptance is Extract<ProviderEventAcceptance, { status: "accepted" }> {
+  if (acceptance.status !== "accepted") return false;
+  // A replayed `created` re-runs idempotent handlers; a replayed `prompted` is never re-routed.
+  if (event.action === "created") return true;
+  return acceptance.replayed !== true && (followUp === undefined || followUp === "dispatch");
+}
+
+async function dispatchLinearSession(
+  event: NormalizedLinearAgentSessionEvent,
+  events: readonly DurableProviderEvent[],
+  handlers: Set<TriggerHandler>,
+  options: LinearWebhookSourceOptions,
+): Promise<void> {
+  const settled = await Promise.allSettled(
+    events.flatMap((acceptedEvent) => Array.from(handlers, (handler) => handler(acceptedEvent))),
+  );
+  const rejected = settled.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (rejected === undefined) return;
+  reportFailure(rejected.reason, {
+    component: "triggers",
+    operation: "linear.agent_session.dispatch",
+    provider: "linear",
+  });
+  options.sessions?.reportDispatchFailure(event);
+}
+
+async function applyLinearLifecycle(
+  event: LinearLifecycleEvent,
+  verified: VerifiedLinearRequest,
+  options: LinearWebhookSourceOptions,
+): Promise<Response> {
+  if (options.lifecycle === undefined) {
+    logger.info(
+      { deliveryId: verified.deliveryId, kind: event.kind },
+      "ignoring Linear lifecycle event",
+    );
+    return new Response("OK", { status: 200 });
+  }
+  const claim = await options.lifecycle.claim({
+    linearOrganizationId: event.organizationId,
+    deliveryId: verified.deliveryId,
+    signatureHash: verified.signatureHash,
+    source: `linear.${event.kind}`,
+    payload: verified.payload,
+    receivedAt: verified.receivedAt,
+  });
+  if (claim.status !== "claimed") {
+    logger.info(
+      { deliveryId: verified.deliveryId, kind: event.kind, outcome: claim.status },
+      "Linear lifecycle event not applied",
+    );
+    return new Response("OK", { status: 200 });
+  }
+  await options.lifecycle.apply(event, claim);
   return new Response("OK", { status: 200 });
 }
 

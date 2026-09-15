@@ -26,6 +26,7 @@ import {
   type NormalizedLinearIssueEvent,
 } from "./events.js";
 import { matchLinearTriggers, readLinearInvocationParserMessage } from "./match.js";
+import { createLinearSessionHooks, type LinearSessionHookDependencies } from "./session-hooks.js";
 
 export interface LinearIssueOutputContext {
   provider: "linear";
@@ -201,6 +202,8 @@ export type LinearContextClient = Partial<
 export function createLinearTriggerProvider(options: {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   client?: LinearContextClient;
+  /** Agent-session lifecycle hooks; absent when the registration has no session state. */
+  session?: LinearSessionHookDependencies;
 }): TriggerProvider<
   "linear",
   LinearTriggerContext,
@@ -272,6 +275,7 @@ export function createLinearTriggerProvider(options: {
         ? materializeSessionContext(linear, options.client)
         : materializeIssueContext(linear, options.client);
     },
+    ...(options.session === undefined ? {} : createLinearSessionHooks(options.session)),
   };
 }
 

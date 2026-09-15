@@ -21,9 +21,22 @@ import type {
 } from "../../db/types.js";
 import { outputContextProvider, replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { logger } from "../../logger.js";
+import type { ExecutionControl } from "../../daemons/execution-control.js";
+import {
+  LINEAR_OUTPUT_TOOLS,
+  createLinearAgentOutputExecutors,
+  linearAgentSessionAvailable,
+} from "../../triggers/linear/agent-outputs.js";
+import { createLinearMirror } from "../../triggers/linear/mirror.js";
 import { createLinearTriggerProvider } from "../../triggers/linear/provider.js";
 import { createLinearReplyExecutor } from "../../triggers/linear/reply.js";
-import { createLinearWebhookSource } from "../../triggers/linear/webhook.js";
+import { LinearSessionCoordinator } from "../../triggers/linear/session-coordinator.js";
+import type { LinearSessionState } from "../../triggers/linear/session-state.js";
+import {
+  createLinearWebhookSource,
+  type LinearWebhookSourceOptions,
+} from "../../triggers/linear/webhook.js";
+import type { ProviderOutputRegistration } from "../registration.js";
 import type { ProviderConnectionRegistration, ProviderRegistration } from "../registration.js";
 import {
   createLinearApiClient,
@@ -49,6 +62,9 @@ export interface CreateLinearRegistrationOptions {
   configuration?: LinearRegistrationConfiguration | null;
   connectionClient?: LinearConnectionClient;
   apiClient?: LinearApiClient;
+  /** Agent-session queues shared across registrations; sessions are disabled without it. */
+  sessionState?: LinearSessionState;
+  executionControl?: ExecutionControl;
   fetch?: typeof fetch;
   configurationVersion?: number;
   expectedConfigurationVersion?: number;
@@ -91,17 +107,20 @@ export function createLinearRegistration(
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     });
   const database = options.database;
-  const api =
-    database === null
+  const api = createLinearApi(options, connectionClient);
+  const sessions =
+    database === null ||
+    api === undefined ||
+    options.sessionState === undefined ||
+    options.executionControl === undefined
       ? undefined
-      : (options.apiClient ??
-        createLinearApiClient({
-          connectionForLinearOrganization: (linearOrganizationId) =>
-            database.findLinearConnection(linearOrganizationId),
-          withLinearConnectionRefresh: database.withLinearConnectionRefresh.bind(database),
-          connectionClient,
-          ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-        }));
+      : createLinearSessions({
+          database,
+          api,
+          state: options.sessionState,
+          control: options.executionControl,
+          publicBaseUrl: options.publicBaseUrl,
+        });
   const accept =
     database === null
       ? () => Promise.reject(new DatabaseUnavailableError())
@@ -116,23 +135,12 @@ export function createLinearRegistration(
             providerApplicationId: configuration.clientId,
             providerConfigurationVersion: options.configurationVersion ?? 0,
           });
-  const webhook = createLinearWebhookSource({
-    signingSecret: configuration.webhookSecret,
+  const webhook = createLinearWebhook({
+    webhookSecret: configuration.webhookSecret,
     accept,
-    ...(database === null
-      ? {}
-      : {
-          canHydrateIssue: async (linearOrganizationId) => {
-            const connection = await database.findLinearConnection(linearOrganizationId);
-            return connection !== undefined && !linearConnectionRequiresReauthorization(connection);
-          },
-        }),
-    ...(api === undefined
-      ? {}
-      : {
-          resolveIssue: ({ linearOrganizationId, issueId }) =>
-            api.readIssue({ linearOrganizationId, issueId }),
-        }),
+    database,
+    api,
+    sessions,
   });
   if (database === null) {
     return {
@@ -171,6 +179,16 @@ export function createLinearRegistration(
         createLinearTriggerProvider({
           configurationStoreForProject,
           ...(api === undefined ? {} : { client: api }),
+          ...(sessions === undefined
+            ? {}
+            : {
+                session: {
+                  coordinator: sessions.coordinator,
+                  mirror: sessions.mirror,
+                  database,
+                  client: api,
+                },
+              }),
         }),
     ],
     sources: [webhook],
@@ -184,9 +202,105 @@ export function createLinearRegistration(
               available: outputContextProvider("linear"),
               execute: createLinearReplyExecutor({ client: api }),
             },
+            ...(sessions === undefined ? [] : sessions.outputs),
           ],
     requests: [{ name: "linear.events", handle: (request) => webhook.handle(request) }],
   };
+}
+
+function createLinearApi(
+  options: CreateLinearRegistrationOptions,
+  connectionClient: LinearConnectionClient,
+): LinearApiClient | undefined {
+  const database = options.database;
+  if (database === null) return undefined;
+  return (
+    options.apiClient ??
+    createLinearApiClient({
+      connectionForLinearOrganization: (linearOrganizationId) =>
+        database.findLinearConnection(linearOrganizationId),
+      withLinearConnectionRefresh: database.withLinearConnectionRefresh.bind(database),
+      connectionClient,
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    })
+  );
+}
+
+function createLinearWebhook(input: {
+  webhookSecret: string;
+  accept: LinearWebhookSourceOptions["accept"];
+  database: Database | null;
+  api: LinearApiClient | undefined;
+  sessions: ReturnType<typeof createLinearSessions> | undefined;
+}): ReturnType<typeof createLinearWebhookSource> {
+  const { database, api, sessions } = input;
+  return createLinearWebhookSource({
+    signingSecret: input.webhookSecret,
+    accept: input.accept,
+    ...(database === null
+      ? {}
+      : {
+          canHydrateIssue: async (linearOrganizationId) => {
+            const connection = await database.findLinearConnection(linearOrganizationId);
+            return connection !== undefined && !linearConnectionRequiresReauthorization(connection);
+          },
+        }),
+    ...(api === undefined
+      ? {}
+      : {
+          resolveIssue: ({ linearOrganizationId, issueId }) =>
+            api.readIssue({ linearOrganizationId, issueId }),
+        }),
+    ...(sessions === undefined || database === null
+      ? {}
+      : {
+          sessions: sessions.coordinator,
+          lifecycle: {
+            claim: (claimInput) => database.claimLinearLifecycleReceipt(claimInput),
+            apply: (event, claim) => sessions.coordinator.applyLifecycle(event, claim),
+          },
+        }),
+  });
+}
+
+function createLinearSessions(input: {
+  database: Database;
+  api: LinearApiClient;
+  state: LinearSessionState;
+  control: ExecutionControl;
+  publicBaseUrl: string;
+}): {
+  coordinator: LinearSessionCoordinator;
+  mirror: ReturnType<typeof createLinearMirror>;
+  outputs: ProviderOutputRegistration[];
+} {
+  input.state.client = input.api;
+  const coordinator = new LinearSessionCoordinator({
+    state: input.state,
+    control: input.control,
+    database: input.database,
+    publicBaseUrl: input.publicBaseUrl,
+  });
+  const mirror = createLinearMirror({
+    coordinator,
+    database: input.database,
+    control: input.control,
+  });
+  const executors = createLinearAgentOutputExecutors({ coordinator, database: input.database });
+  const outputs: ProviderOutputRegistration[] = (
+    [
+      ["linear.response", executors.response],
+      ["linear.ask", executors.ask],
+      ["linear.plan", executors.plan],
+      ["linear.link", executors.link],
+    ] as const
+  ).map(([type, execute]) => ({
+    type,
+    tool: LINEAR_OUTPUT_TOOLS[type],
+    available: linearAgentSessionAvailable,
+    execute,
+  }));
+  return { coordinator, mirror, outputs };
 }
 
 function emptyLinearRegistration(

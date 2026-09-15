@@ -1,3 +1,4 @@
+import { createLinearSessionState } from "./triggers/linear/session-state.js";
 import { randomBytes } from "node:crypto";
 import { validateHeaderName, type IncomingMessage } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -132,6 +133,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       auth,
       applicationBaseUrl: identity.appUrl,
       executionControl,
+      linearSessionState: createLinearSessionState(),
     });
     const providerApplications = createProviderApplications({
       auth,

@@ -11,6 +11,10 @@ export function logProviderEventIntake(input: {
   acceptance: ProviderEventAcceptance;
   repository?: string | undefined;
   resourceId?: string | undefined;
+  /** The transport `linear-delivery` header when the durable delivery id is semantic. */
+  transportDeliveryId?: string | undefined;
+  /** The follow-up routing outcome of a Linear `prompted` activity. */
+  followUp?: string | undefined;
   log?: EventAuditLogger;
 }): void {
   const acceptance = input.acceptance;
@@ -25,6 +29,13 @@ export function logProviderEventIntake(input: {
       ...(acceptance.status === "dropped" ? { reason: acceptance.reason } : {}),
       ...(input.repository === undefined ? {} : { repository: input.repository }),
       ...(input.resourceId === undefined ? {} : { resourceId: input.resourceId }),
+      ...(input.transportDeliveryId === undefined
+        ? {}
+        : { transportDeliveryId: input.transportDeliveryId }),
+      ...(input.followUp === undefined ? {} : { followUp: input.followUp }),
+      ...(acceptance.status === "accepted" && acceptance.replayed === true
+        ? { replayed: true }
+        : {}),
     },
     "provider event intake completed",
   );

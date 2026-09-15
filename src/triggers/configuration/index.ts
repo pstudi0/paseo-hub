@@ -115,18 +115,26 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
 function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
   const replyType = automaticReplyType(trigger.on);
   if (replyType === undefined) return trigger;
+  // A Linear session `response` completes the session, so its automatic grant is bounded.
+  const grant =
+    replyType === "linear.response"
+      ? { type: replyType, required: false, max: 1 }
+      : { type: replyType, required: false };
   return {
     ...trigger,
     steps: trigger.steps.map((step) => ({
       ...step,
       allowOutputs: step.allowOutputs.some(({ type }) => type === replyType)
         ? step.allowOutputs
-        : [...step.allowOutputs, { type: replyType, required: false }],
+        : [...step.allowOutputs, grant],
     })),
   };
 }
 
-function automaticReplyType(event: string): string | undefined {
+export function automaticReplyType(event: string): string | undefined {
+  if (event === "linear.agent_session_created" || event === "linear.agent_session_prompted") {
+    return "linear.response";
+  }
   const provider = event.split(".", 1)[0];
   return provider === "slack" ||
     provider === "discord" ||
