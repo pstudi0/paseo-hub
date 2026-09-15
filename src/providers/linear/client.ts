@@ -1,8 +1,20 @@
 import { z } from "zod";
+import type { JsonValue } from "../../config/schema.js";
 import type { Database, LinearConnectionRecord } from "../../db/types.js";
 
-/** The minimum authority required to read issues and leave an outcome on the issue. */
-export const LINEAR_REQUIRED_SCOPES = ["read", "comments:create"] as const;
+/**
+ * The authority a Linear agent needs: read issues, update them (state, delegate, attachments),
+ * leave comments, and be delegated to or mentioned as an app user. One set gates every
+ * connection: a workspace authorized with fewer scopes reports `requiresReauthorization` and its
+ * events are dropped until an administrator connects it again.
+ */
+export const LINEAR_REQUIRED_SCOPES = [
+  "read",
+  "write",
+  "comments:create",
+  "app:assignable",
+  "app:mentionable",
+] as const;
 
 /** Keep an issue description plus its preceding discussion within one bounded context window. */
 export const LINEAR_ISSUE_CONTEXT_LIMIT = 50;
@@ -14,7 +26,8 @@ const LinearTokenResponseSchema = z
     access_token: z.string().min(1),
     refresh_token: z.string().min(1).optional(),
     expires_in: z.number().finite().positive().optional(),
-    scope: z.string().optional(),
+    // Applications created before December 2023 receive the granted scopes as an array.
+    scope: z.union([z.string(), z.array(z.string())]).optional(),
   })
   .passthrough();
 
@@ -29,7 +42,12 @@ const ViewerResponseSchema = z.object({
 
 const GraphqlErrorSchema = z.object({
   errors: z
-    .array(z.object({ message: z.string().min(1) }))
+    .array(
+      z.object({
+        message: z.string().min(1),
+        extensions: z.object({ code: z.string().optional() }).passthrough().optional(),
+      }),
+    )
     .min(1)
     .optional(),
 });
@@ -43,15 +61,24 @@ const IssueResponseSchema = z.object({
         title: z.string(),
         description: z.string().nullable().optional(),
         url: z.string().url().optional(),
+        branchName: z.string().min(1).optional(),
+        team: z
+          .object({ id: z.string().min(1), key: z.string().min(1), name: z.string() })
+          .nullable()
+          .optional(),
         project: z
           .object({ id: z.string().min(1) })
           .nullable()
           .optional(),
         state: z
-          .object({ id: z.string().min(1) })
+          .object({ id: z.string().min(1), name: z.string(), type: z.string().min(1) })
           .nullable()
           .optional(),
         assignee: z
+          .object({ id: z.string().min(1) })
+          .nullable()
+          .optional(),
+        delegate: z
           .object({ id: z.string().min(1) })
           .nullable()
           .optional(),
@@ -89,6 +116,103 @@ const CommentResponseSchema = z.object({
   }),
 });
 
+const AgentActivityCreateResponseSchema = z.object({
+  data: z.object({
+    agentActivityCreate: z.object({
+      success: z.boolean(),
+      agentActivity: z.object({ id: z.string().min(1) }),
+    }),
+  }),
+});
+
+const AgentSessionUpdateResponseSchema = z.object({
+  data: z.object({ agentSessionUpdate: z.object({ success: z.boolean() }) }),
+});
+
+export type LinearAgentSessionActivityType =
+  | "prompt"
+  | "response"
+  | "error"
+  | "elicitation"
+  | "thought"
+  | "action";
+
+/** GraphQL `__typename` of each `AgentActivityContent` member, by its `AgentActivityType` value. */
+const ACTIVITY_CONTENT_TYPENAMES: ReadonlyMap<string, LinearAgentSessionActivityType> = new Map([
+  ["AgentActivityPromptContent", "prompt"],
+  ["AgentActivityResponseContent", "response"],
+  ["AgentActivityErrorContent", "error"],
+  ["AgentActivityElicitationContent", "elicitation"],
+  ["AgentActivityThoughtContent", "thought"],
+  ["AgentActivityActionContent", "action"],
+]);
+
+const AgentSessionActivityNodeSchema = z.object({
+  id: z.string().min(1),
+  createdAt: z.string().datetime(),
+  signal: z.string().nullable().optional(),
+  user: z
+    .object({ id: z.string().min(1), name: z.string().min(1).nullable().optional() })
+    .nullable()
+    .optional(),
+  content: z.object({ __typename: z.string().min(1), body: z.string().optional() }),
+});
+
+const AgentSessionActivitiesResponseSchema = z.object({
+  data: z.object({
+    agentSession: z.object({
+      activities: z.object({
+        nodes: z.array(AgentSessionActivityNodeSchema),
+        pageInfo: z.object({ hasPreviousPage: z.boolean() }),
+      }),
+    }),
+  }),
+});
+
+const TeamStatesResponseSchema = z.object({
+  data: z.object({
+    team: z
+      .object({
+        states: z.object({
+          nodes: z.array(
+            z.object({
+              id: z.string().min(1),
+              name: z.string(),
+              type: z.string().min(1),
+              position: z.number().finite(),
+            }),
+          ),
+        }),
+      })
+      .nullable(),
+  }),
+});
+
+const IssueUpdateResponseSchema = z.object({
+  data: z.object({ issueUpdate: z.object({ success: z.boolean() }) }),
+});
+
+const AttachmentLinkResponseSchema = z.object({
+  data: z.object({ attachmentLinkGitHubPR: z.object({ success: z.boolean() }) }),
+});
+
+/**
+ * A Linear API failure, kept distinguishable from Hub-side errors so callers can react to the
+ * HTTP status (401/403: reauthorize, 429: back off) or to the GraphQL error code Linear attaches
+ * under `extensions.code`. A GraphQL-level error carries the HTTP status of its transport (200).
+ */
+export class LinearApiError extends Error {
+  readonly status: number;
+  readonly code: string | undefined;
+
+  constructor(message: string, details: { status: number; code?: string }) {
+    super(message);
+    this.name = "LinearApiError";
+    this.status = details.status;
+    this.code = details.code;
+  }
+}
+
 export interface LinearInstallation {
   linearOrganizationId: string;
   linearOrganizationName: string;
@@ -110,7 +234,8 @@ export interface LinearConnectionClient {
   authorizationUrl(state: string): string;
   exchangeCode(code: string): Promise<LinearInstallation>;
   refresh(refreshToken: string): Promise<LinearTokenRefresh>;
-  revoke(accessToken: string): Promise<void>;
+  /** Revokes the access token and, when one is held, the refresh token as well. */
+  revoke(accessToken: string, refreshToken?: string | null): Promise<void>;
 }
 
 export interface LinearIssueDetails {
@@ -119,10 +244,59 @@ export interface LinearIssueDetails {
   title: string;
   description: string | null;
   url?: string;
+  /** Linear's suggested git branch name for the issue. */
+  branchName?: string;
+  teamId?: string;
+  team?: { id: string; key: string; name: string };
   projectId: string | null;
   stateId: string | null;
+  state?: { id: string; name: string; type: string } | null;
   assigneeId: string | null;
+  /** The agent user the issue is delegated to; null when nobody is. */
+  delegateId?: string | null;
   labelIds: string[];
+}
+
+/**
+ * The activity payloads an agent emits, as Linear documents them
+ * (https://linear.app/developers/agent-interaction#activity-content-payload).
+ */
+export type LinearActivityContent =
+  | { type: "thought" | "response" | "error" | "elicitation"; body: string }
+  | { type: "action"; action: string; parameter: string; result?: string };
+
+export type LinearActivitySignal = "select" | "auth";
+
+export interface LinearPlanStep {
+  content: string;
+  status: "pending" | "inProgress" | "completed" | "canceled";
+}
+
+/**
+ * One activity read back from a session, discriminated by Linear's `AgentActivityType`. Only the
+ * conversational types carry a body; thoughts and actions are reported by type so a reader can see
+ * they happened without replaying them.
+ */
+export interface LinearAgentSessionActivity {
+  id: string;
+  createdAt: string;
+  signal: string | null;
+  user: { id: string; name?: string } | null;
+  content:
+    | { type: "prompt" | "response" | "error" | "elicitation"; body: string }
+    | { type: "thought" | "action" };
+}
+
+export interface LinearAgentSessionActivityHistory {
+  activities: LinearAgentSessionActivity[];
+  complete: boolean;
+}
+
+export interface LinearTeamState {
+  id: string;
+  name: string;
+  type: string;
+  position: number;
 }
 
 export interface LinearIssueComment {
@@ -151,6 +325,54 @@ export interface LinearApiClient {
     linearOrganizationId: string;
     issueId: string;
     body: string;
+  }): Promise<void>;
+  /**
+   * Emits one activity into an agent session. `id` is a UUID v4 the caller mints so a retried
+   * emission carries the same identity; Linear generates one otherwise.
+   */
+  createAgentActivity(input: {
+    linearOrganizationId: string;
+    agentSessionId: string;
+    id?: string;
+    content: LinearActivityContent;
+    ephemeral?: boolean;
+    signal?: LinearActivitySignal;
+    signalMetadata?: JsonValue;
+  }): Promise<{ id: string }>;
+  /**
+   * Updates the session's plan, external links, or title. External links are only ever added or
+   * removed by name, never replaced wholesale, so links other tools attached survive.
+   */
+  updateAgentSession(input: {
+    linearOrganizationId: string;
+    agentSessionId: string;
+    plan?: readonly LinearPlanStep[];
+    addedExternalUrls?: readonly { label: string; url: string }[];
+    removedExternalUrls?: readonly string[];
+    summary?: string;
+  }): Promise<void>;
+  /** The bounded, chronological activities strictly before `beforeCreatedAt`. */
+  readAgentSessionActivities(input: {
+    linearOrganizationId: string;
+    agentSessionId: string;
+    beforeCreatedAt: string;
+  }): Promise<LinearAgentSessionActivityHistory>;
+  /** A team's workflow states in display order; callers pick by `type` (for example `started`). */
+  readTeamStates(input: {
+    linearOrganizationId: string;
+    teamId: string;
+  }): Promise<LinearTeamState[]>;
+  updateIssue(input: {
+    linearOrganizationId: string;
+    issueId: string;
+    stateId?: string;
+    delegateId?: string;
+  }): Promise<void>;
+  linkGitHubPullRequest(input: {
+    linearOrganizationId: string;
+    issueId: string;
+    url: string;
+    title?: string;
   }): Promise<void>;
 }
 
@@ -246,19 +468,32 @@ export function createLinearConnectionClient(options: {
         ...(token.scopes === undefined ? {} : { scopes: token.scopes }),
       };
     },
-    async revoke(accessToken) {
-      const response = await request("https://api.linear.app/oauth/revoke", {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          client_id: options.clientId,
-          client_secret: options.clientSecret,
-          token: accessToken,
-        }),
-      });
-      if (!response.ok) throw new Error(`Linear revoke HTTP ${response.status}`);
+    async revoke(accessToken, refreshToken) {
+      await revokeToken(request, options, accessToken, "access_token");
+      if (refreshToken !== undefined && refreshToken !== null) {
+        await revokeToken(request, options, refreshToken, "refresh_token");
+      }
     },
   };
+}
+
+async function revokeToken(
+  request: typeof fetch,
+  options: Pick<Parameters<typeof createLinearConnectionClient>[0], "clientId" | "clientSecret">,
+  token: string,
+  tokenTypeHint: "access_token" | "refresh_token",
+): Promise<void> {
+  const response = await request("https://api.linear.app/oauth/revoke", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: options.clientId,
+      client_secret: options.clientSecret,
+      token,
+      token_type_hint: tokenTypeHint,
+    }),
+  });
+  if (!response.ok) throw new Error(`Linear revoke HTTP ${response.status}`);
 }
 
 /**
@@ -324,10 +559,12 @@ export function createLinearApiClient(options: {
         await graphql(request, await accessTokenFor(input.linearOrganizationId), {
           query: `query PaseoIssue($id: String!) {
             issue(id: $id) {
-              id identifier title description url
+              id identifier title description url branchName
+              team { id key name }
               project { id }
-              state { id }
+              state { id name type }
               assignee { id }
+              delegate { id }
               labels { nodes { id } }
             }
           }`,
@@ -343,16 +580,22 @@ export function createLinearApiClient(options: {
             title: issue.title,
             description: issue.description ?? null,
             ...(issue.url === undefined ? {} : { url: issue.url }),
+            ...(issue.branchName === undefined ? {} : { branchName: issue.branchName }),
+            ...(issue.team === undefined || issue.team === null
+              ? {}
+              : { teamId: issue.team.id, team: issue.team }),
             projectId: issue.project?.id ?? null,
             stateId: issue.state?.id ?? null,
+            ...(issue.state === undefined ? {} : { state: issue.state }),
             assigneeId: issue.assignee?.id ?? null,
+            ...(issue.delegate === undefined ? {} : { delegateId: issue.delegate?.id ?? null }),
             labelIds: issue.labels.nodes.map(({ id }) => id),
           };
     },
     async readIssueComments(input) {
       const result = IssueCommentHistoryResponseSchema.parse(
         await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssueCommentHistory($issueId: String!, $before: DateTime!) {
+          query: `query PaseoIssueCommentHistory($issueId: String!, $before: DateTimeOrDuration!) {
             comments(
               last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
               orderBy: createdAt
@@ -400,6 +643,162 @@ export function createLinearApiClient(options: {
       );
       if (!result.data.commentCreate.success) throw new Error("Linear comment was not accepted");
     },
+    async createAgentActivity(input) {
+      const result = AgentActivityCreateResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `mutation PaseoAgentActivityCreate($input: AgentActivityCreateInput!) {
+            agentActivityCreate(input: $input) { success agentActivity { id } }
+          }`,
+          variables: {
+            input: {
+              agentSessionId: input.agentSessionId,
+              ...(input.id === undefined ? {} : { id: input.id }),
+              content: input.content,
+              ...(input.ephemeral === undefined ? {} : { ephemeral: input.ephemeral }),
+              ...(input.signal === undefined ? {} : { signal: input.signal }),
+              ...(input.signalMetadata === undefined
+                ? {}
+                : { signalMetadata: input.signalMetadata }),
+            },
+          },
+        }),
+      );
+      if (!result.data.agentActivityCreate.success) {
+        throw new Error("Linear agent activity was not accepted");
+      }
+      return { id: result.data.agentActivityCreate.agentActivity.id };
+    },
+    async updateAgentSession(input) {
+      const result = AgentSessionUpdateResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `mutation PaseoAgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
+            agentSessionUpdate(id: $id, input: $input) { success }
+          }`,
+          variables: {
+            id: input.agentSessionId,
+            // Never `externalUrls` or `externalLink`: those replace every link on the session.
+            input: {
+              ...(input.plan === undefined ? {} : { plan: input.plan }),
+              ...(input.addedExternalUrls === undefined
+                ? {}
+                : { addedExternalUrls: input.addedExternalUrls }),
+              ...(input.removedExternalUrls === undefined
+                ? {}
+                : { removedExternalUrls: input.removedExternalUrls }),
+              ...(input.summary === undefined ? {} : { summary: input.summary }),
+            },
+          },
+        }),
+      );
+      if (!result.data.agentSessionUpdate.success) {
+        throw new Error("Linear agent session update was not accepted");
+      }
+    },
+    async readAgentSessionActivities(input) {
+      const result = AgentSessionActivitiesResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `query PaseoAgentSessionActivities($id: String!, $before: DateTimeOrDuration!) {
+            agentSession(id: $id) {
+              activities(
+                last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
+                orderBy: createdAt
+                filter: { createdAt: { lt: $before } }
+              ) {
+                nodes {
+                  id createdAt signal user { id name }
+                  content {
+                    __typename
+                    ... on AgentActivityPromptContent { body }
+                    ... on AgentActivityResponseContent { body }
+                    ... on AgentActivityErrorContent { body }
+                    ... on AgentActivityElicitationContent { body }
+                  }
+                }
+                pageInfo { hasPreviousPage }
+              }
+            }
+          }`,
+          variables: { id: input.agentSessionId, before: input.beforeCreatedAt },
+        }),
+      );
+      const session = result.data.agentSession;
+      const activities = session.activities.nodes
+        .map(normalizeAgentSessionActivity)
+        .filter((activity) => activity !== undefined)
+        .sort(compareLinearCommentOrder);
+      return { activities, complete: !session.activities.pageInfo.hasPreviousPage };
+    },
+    async readTeamStates(input) {
+      const result = TeamStatesResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `query PaseoTeamStates($id: String!) {
+            team(id: $id) { states { nodes { id name type position } } }
+          }`,
+          variables: { id: input.teamId },
+        }),
+      );
+      const team = result.data.team;
+      if (team === null) throw new Error("Linear team unavailable");
+      return [...team.states.nodes].sort((left, right) => left.position - right.position);
+    },
+    async updateIssue(input) {
+      const result = IssueUpdateResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `mutation PaseoIssueUpdate($id: String!, $input: IssueUpdateInput!) {
+            issueUpdate(id: $id, input: $input) { success }
+          }`,
+          variables: {
+            id: input.issueId,
+            input: {
+              ...(input.stateId === undefined ? {} : { stateId: input.stateId }),
+              ...(input.delegateId === undefined ? {} : { delegateId: input.delegateId }),
+            },
+          },
+        }),
+      );
+      if (!result.data.issueUpdate.success) throw new Error("Linear issue update was not accepted");
+    },
+    async linkGitHubPullRequest(input) {
+      const result = AttachmentLinkResponseSchema.parse(
+        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+          query: `mutation PaseoAttachmentLinkGitHubPR($issueId: String!, $url: String!, $title: String) {
+            attachmentLinkGitHubPR(issueId: $issueId, url: $url, title: $title) { success }
+          }`,
+          variables: {
+            issueId: input.issueId,
+            url: input.url,
+            ...(input.title === undefined ? {} : { title: input.title }),
+          },
+        }),
+      );
+      if (!result.data.attachmentLinkGitHubPR.success) {
+        throw new Error("Linear pull request link was not accepted");
+      }
+    },
+  };
+}
+
+function normalizeAgentSessionActivity(
+  node: z.infer<typeof AgentSessionActivityNodeSchema>,
+): LinearAgentSessionActivity | undefined {
+  const type = ACTIVITY_CONTENT_TYPENAMES.get(node.content.__typename);
+  if (type === undefined) return undefined;
+  const content: LinearAgentSessionActivity["content"] =
+    type === "thought" || type === "action" ? { type } : { type, body: node.content.body ?? "" };
+  return {
+    id: node.id,
+    createdAt: node.createdAt,
+    signal: node.signal ?? null,
+    user:
+      node.user === undefined || node.user === null
+        ? null
+        : {
+            id: node.user.id,
+            ...(node.user.name === undefined || node.user.name === null
+              ? {}
+              : { name: node.user.name }),
+          },
+    content,
   };
 }
 
@@ -456,7 +855,7 @@ async function readViewer(request: typeof fetch, accessToken: string) {
 async function graphql(
   request: typeof fetch,
   accessToken: string,
-  payload: { query: string; variables: Record<string, string> },
+  payload: { query: string; variables: Record<string, unknown> },
 ): Promise<unknown> {
   const response = await request("https://api.linear.app/graphql", {
     method: "POST",
@@ -466,20 +865,29 @@ async function graphql(
     },
     body: JSON.stringify(payload),
   });
-  if (!response.ok) throw new Error(`Linear GraphQL HTTP ${response.status}`);
+  if (!response.ok) {
+    throw new LinearApiError(`Linear GraphQL HTTP ${response.status}`, {
+      status: response.status,
+    });
+  }
   const result: unknown = await response.json();
   const errors = GraphqlErrorSchema.safeParse(result);
   if (errors.success && errors.data.errors !== undefined) {
-    throw new Error(`Linear GraphQL ${errors.data.errors[0]!.message}`);
+    const [first] = errors.data.errors;
+    throw new LinearApiError(`Linear GraphQL ${first!.message}`, {
+      status: response.status,
+      ...(first!.extensions?.code === undefined ? {} : { code: first!.extensions.code }),
+    });
   }
   return result;
 }
 
-function parseLinearScopes(scope: string | undefined): string[] {
+function parseLinearScopes(scope: string | readonly string[] | undefined): string[] {
+  const values = typeof scope === "string" ? [scope] : (scope ?? []);
   return [
     ...new Set(
-      (scope ?? "")
-        .split(/[\s,]+/u)
+      values
+        .flatMap((value) => value.split(/[\s,]+/u))
         .map((value) => value.trim())
         .filter(Boolean),
     ),

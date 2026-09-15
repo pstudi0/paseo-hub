@@ -1,5 +1,5 @@
 import { expect, type Locator, type Page } from "@playwright/test";
-import AxeBuilder from "@axe-core/playwright";
+import { AxeBuilder } from "@axe-core/playwright";
 import { DaemonHandoffSurface } from "./daemon-handoff.js";
 
 export type AppProvider = "GitHub" | "Slack" | "Discord" | "Linear";
@@ -23,7 +23,8 @@ const APP_SUMMARIES: Readonly<Record<AppProvider, string>> = {
   GitHub: "Reads issues and pull requests, and lets agents push.",
   Slack: "Reads mentions in your workspace and replies in the thread.",
   Discord: "Reads mentions in your server and replies in the thread.",
-  Linear: "Starts project-scoped workflows from issues and posts outcomes back to Linear.",
+  Linear:
+    "Runs as a Linear agent: takes delegated issues and mentions, streams progress into the issue's agent session, and posts outcomes back to Linear.",
 };
 
 /**
@@ -206,16 +207,13 @@ export class AppSection {
   }
 
   async save(): Promise<void> {
-    await this.body()
-      .getByRole("button", {
-        name:
-          this.provider === "Slack"
-            ? /^(?:Connect Slack|Save and continue to Slack)$/u
-            : this.provider === "Linear"
-              ? "Save and continue to Linear"
-              : "Verify and save",
-      })
-      .click();
+    await this.body().getByRole("button", { name: this.saveActionName() }).click();
+  }
+
+  private saveActionName(): string | RegExp {
+    if (this.provider === "Slack") return /^(?:Connect Slack|Save and continue to Slack)$/u;
+    if (this.provider === "Linear") return "Save and continue to Linear";
+    return "Verify and save";
   }
 
   async chooseSlackTransport(transport: "Socket Mode" | "Webhooks"): Promise<void> {
@@ -441,7 +439,7 @@ export class AppSection {
   }
 
   /** HTTPS exposes every user action needed to create and install the Slack app. */
-  async expectSlackSetupActionable(origin: string): Promise<void> {
+  async expectSlackSetupActionable(): Promise<void> {
     await this.expectExpanded();
     await expect(this.body().getByRole("link", { name: "Create a Slack app" })).toBeVisible();
     await expect(this.body().getByRole("list")).toBeVisible();

@@ -42,7 +42,7 @@ describe("project dashboard activity read models", () => {
             accessToken: "expired-token",
             refreshToken: null,
             accessTokenExpiresAt: new Date("2000-01-01T00:00:00.000Z"),
-            scopes: ["read", "comments:create"],
+            scopes: ["read", "write", "comments:create", "app:assignable", "app:mentionable"],
             teamAccess: null,
           },
           {
@@ -56,7 +56,7 @@ describe("project dashboard activity read models", () => {
             accessToken: "expired-token",
             refreshToken: "refresh-token",
             accessTokenExpiresAt: new Date("2000-01-01T00:00:00.000Z"),
-            scopes: ["read", "comments:create"],
+            scopes: ["read", "write", "comments:create", "app:assignable", "app:mentionable"],
             teamAccess: null,
           },
         ],

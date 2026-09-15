@@ -10,7 +10,9 @@ const LinearReplyOutputContextSchema = z.object({
 });
 
 /** Emits a normal Linear issue comment, suitable for a concise eligibility result or draft PR URL. */
-export function createLinearReplyExecutor(options: { client: LinearApiClient }): OutputExecutor {
+export function createLinearReplyExecutor(options: {
+  client: Pick<LinearApiClient, "createComment">;
+}): OutputExecutor {
   return async function executeLinearReply(input) {
     const args = LinearReplyArgsSchema.parse(input.args);
     const context = LinearReplyOutputContextSchema.parse(input.outputContext);

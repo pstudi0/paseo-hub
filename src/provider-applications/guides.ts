@@ -1,3 +1,4 @@
+import { LINEAR_REQUIRED_SCOPES } from "../providers/linear/client.js";
 import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import type { Provider, ProviderApplicationIdentity, ProviderApplicationStatus } from "./index.js";
 
@@ -564,10 +565,28 @@ export const DISCORD_GUIDE: ProviderGuide = {
   receivesEvents: false,
 };
 
+/** The webhook categories as the Linear portal names them, in the order it lists them. */
+export const LINEAR_WEBHOOK_CATEGORIES: readonly string[] = [
+  "Issues",
+  "Comments",
+  "Agent session events",
+  "Inbox notifications",
+  "Permission changes",
+];
+
+/**
+ * The scopes the guide shows come from the same constant the running Linear integration checks
+ * connections against, so the operator never reads a list the app will not actually ask for.
+ */
+export function linearScopesRequested(): readonly string[] {
+  return [...LINEAR_REQUIRED_SCOPES];
+}
+
 export const LINEAR_GUIDE: ProviderGuide = {
   provider: "linear",
   name: "Linear",
-  summary: "Starts project-scoped workflows from issues and posts outcomes back to Linear.",
+  summary:
+    "Runs as a Linear agent: takes delegated issues and mentions, streams progress into the issue's agent session, and posts outcomes back to Linear.",
   portal: {
     label: "Open Linear API applications",
     href: "https://linear.app/settings/api/applications",
@@ -587,7 +606,11 @@ export const LINEAR_GUIDE: ProviderGuide = {
               value: "Linear API applications",
               href: "https://linear.app/settings/api/applications",
             },
-            { kind: "text", value: ", create an application, and give it a name." },
+            {
+              kind: "text",
+              value:
+                ', create an application, and give it a name and an icon: they are how the agent appears in Linear. Linear rejects names that contain "Linear", and the icon must be at least 256 px.',
+            },
           ],
         },
         {
@@ -600,12 +623,36 @@ export const LINEAR_GUIDE: ProviderGuide = {
         },
         {
           segments: [
-            { kind: "text", value: "Create Issue and Comment webhooks using this " },
+            { kind: "text", value: "Turn on webhooks with this " },
             { kind: "term", value: "Webhook URL" },
-            { kind: "text", value: " and a signing secret you will paste below:" },
+            {
+              kind: "text",
+              value: " and a signing secret you will paste below, then select these categories:",
+            },
           ],
           urls: ["events"],
-          events: ["Issue", "Comment"],
+          events: LINEAR_WEBHOOK_CATEGORIES,
+        },
+        {
+          segments: [
+            { kind: "text", value: "Enable " },
+            { kind: "term", value: "Agent session events" },
+            {
+              kind: "text",
+              value:
+                " last, once Hub is deployed at this address: the agent appears in Linear as soon as that category is on.",
+            },
+          ],
+        },
+        {
+          segments: [
+            {
+              kind: "text",
+              value:
+                "When an administrator authorizes the app, Hub asks for these scopes as the app itself (actor=app); the administrator chooses which teams the agent may access:",
+            },
+          ],
+          events: linearScopesRequested(),
         },
         {
           segments: [

@@ -6,7 +6,11 @@ import type { OrganizationAccessValue } from "../../auth/organization-access.js"
 import type { AuthServer } from "../../auth/server.js";
 import { createMemoryDatabase } from "../../db/memory.js";
 import type { StartConnectionAttemptInput } from "../../db/types.js";
-import type { LinearApiClient, LinearConnectionClient } from "./client.js";
+import {
+  LINEAR_REQUIRED_SCOPES,
+  type LinearApiClient,
+  type LinearConnectionClient,
+} from "./client.js";
 import { createLinearRegistration } from "./index.js";
 
 describe("Linear registration", () => {
@@ -156,7 +160,7 @@ describe("Linear registration", () => {
       accessToken: "expired-token",
       refreshToken: null,
       accessTokenExpiresAt: new Date(0),
-      scopes: ["read", "comments:create"],
+      scopes: [...LINEAR_REQUIRED_SCOPES],
       teamAccess: null,
     };
     assert.deepEqual(
@@ -171,6 +175,19 @@ describe("Linear registration", () => {
         linear: [{ ...expired, refreshToken: "refresh-token" }],
       }),
       { status: "connected" },
+    );
+    // A workspace authorized before Hub became a Linear agent only holds the comment scopes; it
+    // has to be connected again by an administrator rather than silently widened.
+    assert.deepEqual(
+      registration.connection.status({
+        github: [],
+        discord: [],
+        slack: [],
+        linear: [
+          { ...expired, refreshToken: "refresh-token", scopes: ["read", "comments:create"] },
+        ],
+      }),
+      { status: "requiresReauthorization" },
     );
   });
 
@@ -205,14 +222,12 @@ describe("Linear registration", () => {
       };
     };
     let issueReads = 0;
-    const apiClient: LinearApiClient = {
+    const apiClient = unusedLinearApiClient({
       readIssue: async () => {
         issueReads += 1;
         throw new Error("under-scoped token must not hydrate");
       },
-      readIssueComments: async () => ({ comments: [], complete: true }),
-      createComment: async () => {},
-    };
+    });
     const registration = createLinearRegistration({
       database,
       auth: null,
@@ -233,6 +248,23 @@ describe("Linear registration", () => {
 
 function linearConfiguration() {
   return { clientId: "client", clientSecret: "secret", webhookSecret: "webhook-secret" };
+}
+
+/** A client whose every call is a test failure, except the methods a test overrides. */
+function unusedLinearApiClient(overrides: Partial<LinearApiClient>): LinearApiClient {
+  const unused = (method: string) => () => Promise.reject(new Error(`${method} is unused`));
+  return {
+    readIssue: unused("readIssue"),
+    readIssueComments: unused("readIssueComments"),
+    createComment: unused("createComment"),
+    createAgentActivity: unused("createAgentActivity"),
+    updateAgentSession: unused("updateAgentSession"),
+    readAgentSessionActivities: unused("readAgentSessionActivities"),
+    readTeamStates: unused("readTeamStates"),
+    updateIssue: unused("updateIssue"),
+    linkGitHubPullRequest: unused("linkGitHubPullRequest"),
+    ...overrides,
+  };
 }
 
 function linearCommentRequest(): Request {

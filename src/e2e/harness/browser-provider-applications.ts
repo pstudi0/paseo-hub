@@ -7,7 +7,11 @@ import { createSlackRegistration } from "../../providers/slack/index.js";
 import { createSlackSocketInstallationVerifier } from "../../providers/slack/installation.js";
 import { startSlackSocketFixture } from "../../test-utils/slack-socket-fixture.js";
 import type { SlackConnectionClient, SlackInstallation } from "../../providers/slack/client.js";
-import type { LinearConnectionClient, LinearInstallation } from "../../providers/linear/client.js";
+import {
+  LINEAR_REQUIRED_SCOPES,
+  type LinearConnectionClient,
+  type LinearInstallation,
+} from "../../providers/linear/client.js";
 import type { ProviderRegistration } from "../../providers/registration.js";
 import {
   ProviderVerificationError,
@@ -333,7 +337,7 @@ class BrowserLinearConnections implements LinearConnectionClient {
       accessToken: "linear-token",
       refreshToken: "linear-refresh-token",
       accessTokenExpiresAt: null,
-      scopes: ["read", "comments:create"],
+      scopes: [...LINEAR_REQUIRED_SCOPES],
     });
   }
 
