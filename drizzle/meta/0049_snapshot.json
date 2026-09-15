@@ -1,5 +1,5 @@
 {
-  "id": "182abfa8-d71a-4710-a282-89f77a70c07c",
+  "id": "300a7f64-ced9-404e-aac0-bcbfc3a747ab",
   "prevId": "5d38ccc3-86d8-40ad-8f9c-9d1c04669de2",
   "version": "7",
   "dialect": "postgresql",
@@ -2601,11 +2601,11 @@
           "method": "btree",
           "with": {}
         },
-        "linear_agent_sessions_organization_issue_idx": {
-          "name": "linear_agent_sessions_organization_issue_idx",
+        "linear_agent_sessions_linear_organization_issue_idx": {
+          "name": "linear_agent_sessions_linear_organization_issue_idx",
           "columns": [
             {
-              "expression": "organization_id",
+              "expression": "linear_organization_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

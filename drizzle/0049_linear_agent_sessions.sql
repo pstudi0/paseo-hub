@@ -37,7 +37,7 @@ ALTER TABLE "linear_agent_sessions" ADD CONSTRAINT "linear_agent_sessions_curren
 ALTER TABLE "linear_agent_sessions" ADD CONSTRAINT "linear_agent_sessions_connection_organization_fk" FOREIGN KEY ("linear_connection_id","organization_id") REFERENCES "public"."linear_connections"("id","organization_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "linear_agent_sessions_linear_session_unique" ON "linear_agent_sessions" USING btree ("linear_session_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "linear_agent_sessions_id_organization_unique" ON "linear_agent_sessions" USING btree ("id","organization_id");--> statement-breakpoint
-CREATE INDEX "linear_agent_sessions_organization_issue_idx" ON "linear_agent_sessions" USING btree ("organization_id","issue_id");--> statement-breakpoint
+CREATE INDEX "linear_agent_sessions_linear_organization_issue_idx" ON "linear_agent_sessions" USING btree ("linear_organization_id","issue_id");--> statement-breakpoint
 CREATE INDEX "linear_agent_sessions_agent_session_idx" ON "linear_agent_sessions" USING btree ("agent_session_id");--> statement-breakpoint
 CREATE INDEX "linear_agent_sessions_current_execution_idx" ON "linear_agent_sessions" USING btree ("current_execution_id");--> statement-breakpoint
 CREATE INDEX "agent_sessions_project_workspace_key_idx" ON "agent_sessions" USING btree ("project_id","workspace_key");

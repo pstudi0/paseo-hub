@@ -2808,13 +2808,17 @@ class PgDatabase implements Database {
   }
 
   async findAgentSessionsByWorkspaceKey(projectId: string, workspaceKey: string) {
-    const result = await this.pool.query<AgentSessionDataRow>(
-      `select data from agent_sessions
-       where project_id = $1 and workspace_key = $2
-       order by created_at desc, id desc`,
-      [projectId, workspaceKey],
-    );
-    return result.rows.map(toAgentSessionRecord);
+    try {
+      const result = await this.pool.query<AgentSessionDataRow>(
+        `select data from agent_sessions
+         where project_id = $1 and workspace_key = $2
+         order by created_at desc, id desc`,
+        [projectId, workspaceKey],
+      );
+      return result.rows.map(toAgentSessionRecord);
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
   }
 
   async attachExecutionToSession(

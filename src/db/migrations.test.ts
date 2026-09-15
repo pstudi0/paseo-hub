@@ -101,6 +101,10 @@ describe("database migrations", () => {
       /"linear_agent_sessions_connection_organization_fk" FOREIGN KEY \("linear_connection_id","organization_id"\) REFERENCES "public"\."linear_connections"\("id","organization_id"\) ON DELETE cascade/u,
     );
     assert.match(migration, /CREATE UNIQUE INDEX "linear_agent_sessions_linear_session_unique"/u);
+    assert.match(
+      migration,
+      /CREATE INDEX "linear_agent_sessions_linear_organization_issue_idx" ON "linear_agent_sessions" USING btree \("linear_organization_id","issue_id"\)/u,
+    );
     assert.match(migration, /CREATE INDEX "agent_sessions_project_workspace_key_idx"/u);
     assert.doesNotMatch(migration, /^(?:UPDATE|INSERT|DELETE) /mu);
   });

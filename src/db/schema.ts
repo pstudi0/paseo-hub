@@ -1127,7 +1127,10 @@ export const linearAgentSessions = pgTable(
   (table) => [
     uniqueIndex("linear_agent_sessions_linear_session_unique").on(table.linearSessionId),
     uniqueIndex("linear_agent_sessions_id_organization_unique").on(table.id, table.organizationId),
-    index("linear_agent_sessions_organization_issue_idx").on(table.organizationId, table.issueId),
+    index("linear_agent_sessions_linear_organization_issue_idx").on(
+      table.linearOrganizationId,
+      table.issueId,
+    ),
     index("linear_agent_sessions_agent_session_idx").on(table.agentSessionId),
     index("linear_agent_sessions_current_execution_idx").on(table.currentExecutionId),
     check(
