@@ -176,7 +176,17 @@ export class LinearActivityQueue {
     reportFailure(
       error,
       { component: "triggers", operation: "linear.mirror.emit", provider: "linear" },
-      { diagnostic: { sessionId: this.options.sessionId, kind: describe(item) } },
+      {
+        diagnostic: {
+          sessionId: this.options.sessionId,
+          kind: describe(item),
+          // Linear's validation message names the rejected field; it never echoes the body.
+          ...(error instanceof LinearApiError ? { linearMessage: error.message } : {}),
+          ...(item.kind === "activity" && item.content.type === "action"
+            ? { action: item.content.action, parameterLength: item.content.parameter.length }
+            : {}),
+        },
+      },
     );
     return isTerminal(item) ? "failed" : "dropped";
   }
