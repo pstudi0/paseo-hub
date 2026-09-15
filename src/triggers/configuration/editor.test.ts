@@ -436,6 +436,7 @@ test.each(["github.issue_label_added", "github.pull_request_label_added"])(
 
 const LINEAR_TEAM_ID = "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01";
 const LINEAR_SESSION = ADVANCED.replace("slack.mention", "linear.agent_session_created")
+  .replace('from_users: ["*"]', "from_users: [user-anthony]")
   .replace("channels: [engineering]", `team: ${LINEAR_TEAM_ID}\n      source: [delegation]`)
   .replace("  github:", "  linear:\n    on_start: started\n  github:");
 
@@ -458,7 +459,10 @@ test.each(["linear.agent_session_created", "linear.agent_session_prompted"])(
 test.each(["linear.agent_session_created", "linear.agent_session_prompted"])(
   "requires a Linear team for %s",
   (event) => {
-    const missing = ADVANCED.replace("slack.mention", event);
+    const missing = ADVANCED.replace("slack.mention", event).replace(
+      'from_users: ["*"]',
+      "from_users: [user-anthony]",
+    );
     expect(TriggerDocumentSchema.safeParse(parseDocument(missing).toJS()).success).toBe(false);
     const projection = projectTriggerForm(
       missing.replace("channels: [engineering]", `team: ${LINEAR_TEAM_ID}`),
@@ -485,12 +489,58 @@ test("round trips the Linear team and leaves the session-only YAML nodes alone",
   });
   const value = TriggerDocumentSchema.parse(parseDocument(patched).toJS());
   expect(value.on["linear.agent_session_created"]?.filters).toEqual({
-    from_users: ["*"],
+    from_users: ["user-anthony"],
     team: "another-team",
     source: ["delegation"],
   });
   expect(value.run.linear).toEqual({ on_start: "started" });
   expect(value.run.prompt).toBe("Changed.");
+});
+
+const DELEGATION_AUDIENCE_ERROR =
+  "Name the Linear user IDs allowed to delegate; everyone is not allowed because a delegation runs code on your daemon.";
+
+test("a delegation trigger names its audience on the field, never everyone", () => {
+  const projection = projectTriggerForm(LINEAR_SESSION);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  expect(triggerFormErrors(projection.value)).toEqual({});
+  for (const allowedUsers of ["*", "", "  ", "user-anthony, *"]) {
+    expect(triggerFormErrors({ ...projection.value, allowedUsers })).toEqual({
+      allowedUsers: DELEGATION_AUDIENCE_ERROR,
+    });
+  }
+  expect(mergeTriggerForm("", { ...projection.value, allowedUsers: "*" })).toEqual({
+    status: "incomplete",
+    reason: DELEGATION_AUDIENCE_ERROR,
+  });
+  expect(() =>
+    patchTriggerYaml(LINEAR_SESSION, { ...projection.value, allowedUsers: "*" }),
+  ).toThrow(DELEGATION_AUDIENCE_ERROR);
+
+  const prompted = { ...projection.value, event: "linear.agent_session_prompted" as const };
+  expect(triggerFormErrors({ ...prompted, allowedUsers: "*" })).toEqual({});
+  expect(triggerFormErrors({ ...prompted, allowedUsers: "" })).toEqual({
+    allowedUsers: "Name at least one user ID, or let everyone trigger it.",
+  });
+});
+
+test("switching to a delegation event clears an everyone audience so the field asks for names", () => {
+  const projection = projectTriggerForm(ADVANCED);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  expect(projection.value.allowedUsers).toBe("*");
+  const created = changeTriggerEvent(projection.value, "linear.agent_session_created");
+  expect(created.allowedUsers).toBe("");
+  expect(triggerFormErrors({ ...created, qualifiers: { team: LINEAR_TEAM_ID } })).toEqual({
+    connection: "Connection is required.",
+    allowedUsers: DELEGATION_AUDIENCE_ERROR,
+  });
+  const named = changeTriggerEvent(
+    { ...projection.value, allowedUsers: "user-anthony" },
+    "linear.agent_session_created",
+  );
+  expect(named.allowedUsers).toBe("user-anthony");
+  const prompted = changeTriggerEvent(projection.value, "linear.agent_session_prompted");
+  expect(prompted.allowedUsers).toBe("*");
 });
 
 test("the Linear continuation is offered only to session events and is reset when the event leaves them", () => {

@@ -58,6 +58,85 @@ steps:
     assert.doesNotMatch(trigger.yaml, /include:|partials|steps:/u);
   });
 
+  it("carries a Linear agent-session workflow's filters, authority, and issue branch into one document", () => {
+    const migrated = migrateLegacyBundle({
+      files: [
+        {
+          path: ".paseo/hub.yml",
+          content: `
+environments:
+  issues:
+    kind: daemon
+    daemon: devbox
+    cwd: /workspace/company
+    worktree:
+      mode: branch-off
+      newBranch: linear/\${{ linear.issue.identifier }}
+agents:
+  codex:
+    provider: codex
+    model: gpt-5.6-sol
+`,
+        },
+        {
+          path: ".paseo/workflows/delegate.yml",
+          content: `
+name: delegate
+on: linear.agent_session_created
+max_runtime: 2h
+filters:
+  connection: acme-linear
+  team: 6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01
+  from_users: [user-anthony]
+  source: [delegation, mention]
+  allow_automations: true
+steps:
+  - id: work
+    environment: issues
+    max_runtime: 90m
+    idle_timeout: 10m
+    agent: codex
+    linear:
+      on_start: started
+      mirror:
+        thoughts: none
+    prompt:
+      - text: "Handle \${{ paseo.prompt }}"
+`,
+        },
+      ],
+    });
+
+    assert.equal(migrated.length, 1);
+    const trigger = migrated[0];
+    assert.equal(trigger?.format, "single_run");
+    if (trigger?.format !== "single_run") return;
+    assert.match(trigger.yaml, /team: 6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01/u);
+    assert.match(trigger.yaml, /source:\n\s+- delegation\n\s+- mention/u);
+    assert.match(trigger.yaml, /allow_automations: true/u);
+    assert.match(trigger.yaml, /newBranch: linear\/\$\{\{ linear\.issue\.identifier \}\}/u);
+    assert.match(
+      trigger.yaml,
+      /linear:\n\s+on_start: started\n\s+mirror:\n\s+actions: true\n\s+thoughts: none\n\s+plan: true\n\s+permissions: true/u,
+    );
+    assert.doesNotMatch(trigger.yaml, /delegate: true|steps:/u);
+
+    const compiled = trigger.compiled.events[0];
+    assert.equal(compiled?.on, "linear.agent_session_created");
+    assert.deepEqual(compiled?.filters, {
+      connection: "acme-linear",
+      team: "6f1e7b2a-1b6e-4c47-9d2c-0d0d0d0d0d01",
+      from_users: ["user-anthony"],
+      source: ["delegation", "mention"],
+      allow_automations: true,
+    });
+    assert.deepEqual(compiled?.steps[0]?.linear, {
+      onStart: { kind: "type", type: "started" },
+      delegate: false,
+      mirror: { actions: true, thoughts: "none", plan: true, permissions: true },
+    });
+  });
+
   it("preserves a multi-step workflow as one self-contained normalized legacy trigger", () => {
     const migrated = migrateLegacyBundle({
       files: [

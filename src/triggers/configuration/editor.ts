@@ -300,12 +300,7 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   else if (!IDENTIFIER.test(name)) {
     errors.name = "Use lowercase letters, digits, and hyphens, starting with a letter.";
   }
-  if (eventDefinition(value.event).origin === "provider") {
-    if (value.connection.trim().length === 0) errors.connection = "Connection is required.";
-    if (value.allowedUsers.trim().length === 0) {
-      errors.allowedUsers = "Name at least one user ID, or let everyone trigger it.";
-    }
-  }
+  Object.assign(errors, accessErrors(value));
   for (const qualifier of eventDefinition(value.event).qualifiers) {
     const selection = value.qualifiers[qualifier.key];
     if (qualifier.required && (selection === undefined || selection.trim().length === 0)) {
@@ -330,6 +325,26 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   }
   Object.assign(errors, continuationErrors(value));
   if (value.prompt.trim().length === 0) errors.prompt = "Instructions are required.";
+  return errors;
+}
+
+const DELEGATION_AUDIENCE_ERROR =
+  "Name the Linear user IDs allowed to delegate; everyone is not allowed because a delegation runs code on your daemon.";
+
+/**
+ * The connection and audience an externally-originated event needs. The compiler refuses `"*"`
+ * on `linear.agent_session_created` for the same reason, but it reports against the whole
+ * document; naming the field here is what puts the sentence beside the control that has to change.
+ */
+function accessErrors(value: TriggerFormValue): TriggerFieldErrors {
+  if (eventDefinition(value.event).origin !== "provider") return {};
+  const errors: TriggerFieldErrors = {};
+  if (value.connection.trim().length === 0) errors.connection = "Connection is required.";
+  if (value.event === "linear.agent_session_created" && users(value.allowedUsers).includes("*")) {
+    errors.allowedUsers = DELEGATION_AUDIENCE_ERROR;
+  } else if (value.allowedUsers.trim().length === 0) {
+    errors.allowedUsers = "Name at least one user ID, or let everyone trigger it.";
+  }
   return errors;
 }
 
@@ -450,11 +465,16 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
       }
     }
   }
+  const allowedUsers =
+    event === "linear.agent_session_created" && users(value.allowedUsers).includes("*")
+      ? ""
+      : value.allowedUsers;
   return {
     ...value,
     event,
     qualifiers,
     connection: sameProvider ? value.connection : "",
+    allowedUsers,
     continuationMode:
       value.continuationMode === "linear" && !isLinearAgentSessionEvent(event)
         ? "conversation"

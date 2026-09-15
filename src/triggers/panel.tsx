@@ -633,7 +633,8 @@ function TriggerForm({
   const githubEnabled = form.githubConnection !== "";
   const [githubExpanded, setGithubExpanded] = useState(githubEnabled);
   const [optionsExpanded, setOptionsExpanded] = useState(false);
-  const everyone = form.allowedUsers.trim() === "*";
+  const namedAudienceOnly = form.event === "linear.agent_session_created";
+  const everyone = !namedAudienceOnly && form.allowedUsers.trim() === "*";
   const update = <Key extends keyof TriggerFormValue>(key: Key, value: TriggerFormValue[Key]) =>
     onChange({ ...form, [key]: value });
   const text = (key: TriggerTextField) => (value: string) => update(key, value);
@@ -726,18 +727,25 @@ function TriggerForm({
         </Card>
 
         {eventDefinition(form.event).origin === "hub" ? null : (
-          <Card title={EDITOR_STEPS.access.title} description={EDITOR_STEPS.access.description}>
+          <Card
+            title={EDITOR_STEPS.access.title}
+            description={
+              namedAudienceOnly ? DELEGATION_ACCESS_DESCRIPTION : EDITOR_STEPS.access.description
+            }
+          >
             <div className="grid gap-4 sm:grid-cols-2">
-              <FormField id="trigger-audience" label="Audience">
-                {() => (
-                  <SegmentedControl
-                    label="Audience"
-                    value={everyone ? "everyone" : "specific"}
-                    options={AUDIENCE_OPTIONS}
-                    onChange={(value) => update("allowedUsers", value === "everyone" ? "*" : "")}
-                  />
-                )}
-              </FormField>
+              {namedAudienceOnly ? null : (
+                <FormField id="trigger-audience" label="Audience">
+                  {() => (
+                    <SegmentedControl
+                      label="Audience"
+                      value={everyone ? "everyone" : "specific"}
+                      options={AUDIENCE_OPTIONS}
+                      onChange={(value) => update("allowedUsers", value === "everyone" ? "*" : "")}
+                    />
+                  )}
+                </FormField>
+              )}
               {everyone ? null : (
                 <FormField
                   id="trigger-allowed-users"
@@ -993,6 +1001,10 @@ function TriggerForm({
     </div>
   );
 }
+
+/** A delegation runs code on the daemon, so `linear.agent_session_created` never offers "everyone". */
+const DELEGATION_ACCESS_DESCRIPTION =
+  "The Linear users allowed to delegate work. A delegation runs code on your daemon, so it is never open to everyone.";
 
 const AUDIENCE_OPTIONS: readonly SegmentedOption[] = [
   { value: "everyone", label: "Everyone" },

@@ -267,12 +267,17 @@ export interface ExecutionTemplateOptions {
   allowLinearIssue?: boolean;
 }
 
+/**
+ * Render a template at dispatch time. Whether `linear.issue.identifier` may appear was settled at
+ * activation, per environment, by the compiler; here the only question is whether the trigger
+ * context actually carries an issue, which `readPath` answers.
+ */
 export function renderExecutionTemplate(
   template: string,
   executionId: string,
   linear?: LinearExpressionContext,
 ): string {
-  validateExecutionTemplate(template, { allowLinearIssue: linear !== undefined });
+  validateExecutionTemplate(template, { allowLinearIssue: true });
   return renderExpressionTemplate(template, {
     prompt: "",
     context: null,

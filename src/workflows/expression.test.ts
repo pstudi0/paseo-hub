@@ -54,7 +54,7 @@ describe("workflow expression context", () => {
     );
     assert.throws(
       () => renderExecutionTemplate(template, "exec-1"),
-      /linear\.issue\.identifier only for Linear agent session triggers/u,
+      /Linear issue identifier is unavailable/u,
     );
     assert.throws(
       () => validateExecutionTemplate(template),
