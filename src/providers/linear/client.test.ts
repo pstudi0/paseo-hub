@@ -94,6 +94,7 @@ describe("Linear connection client", () => {
       refreshToken: "refresh-token",
       accessTokenExpiresAt: null,
       scopes: ["comments:create", "read"],
+      teamAccess: null,
     };
     const api = createLinearApiClient({
       connectionForLinearOrganization: async () => connection,
@@ -177,6 +178,7 @@ describe("Linear connection client", () => {
       refreshToken: "refresh-token",
       accessTokenExpiresAt: new Date(1_700_000_000_000),
       scopes: ["comments:create", "read"],
+      teamAccess: null,
     };
     const updateTokens = async (update: UpdateLinearConnectionTokensInput) => {
       updates.push(update);
@@ -236,6 +238,7 @@ describe("Linear connection client", () => {
       refreshToken: "refresh-token",
       accessTokenExpiresAt: new Date(1_700_000_000_000),
       scopes: ["comments:create", "read"],
+      teamAccess: null,
     };
     const request: typeof fetch = async (url) => {
       if (readableUrl(url).endsWith("/oauth/token")) {
@@ -300,6 +303,7 @@ describe("Linear connection client", () => {
       refreshToken: "refresh-token",
       accessTokenExpiresAt: new Date(1_700_000_000_000),
       scopes: ["comments:create", "read"],
+      teamAccess: null,
     };
     const updates: unknown[] = [];
     const requests: string[] = [];
@@ -383,6 +387,7 @@ describe("Linear connection client", () => {
       refreshToken: "rotating-refresh-token",
       accessTokenExpiresAt: new Date(1_700_000_000_000),
       scopes: ["comments:create", "read"],
+      teamAccess: null,
     };
     const updates: unknown[] = [];
     const requests: string[] = [];

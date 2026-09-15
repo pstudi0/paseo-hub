@@ -152,7 +152,7 @@ describe("trigger acceptance persistence", () => {
 
     const dropped = await database.acceptLinearEvent({
       linearOrganizationId: "linear-scope-workspace",
-      projectId: "linear-project",
+      resourceId: "linear-project",
       deliveryId: "linear-under-scoped",
       source: "linear.issue",
       payload: {},
@@ -173,7 +173,7 @@ describe("trigger acceptance persistence", () => {
     );
     const accepted = await database.acceptLinearEvent({
       linearOrganizationId: "linear-scope-workspace",
-      projectId: "linear-project",
+      resourceId: "linear-project",
       deliveryId: "linear-reauthorized",
       source: "linear.issue",
       payload: {},
@@ -189,7 +189,7 @@ describe("trigger acceptance persistence", () => {
     );
     const expired = await database.acceptLinearEvent({
       linearOrganizationId: "linear-scope-workspace",
-      projectId: "linear-project",
+      resourceId: "linear-project",
       deliveryId: "linear-expired-without-refresh",
       source: "linear.issue",
       payload: {},
@@ -198,6 +198,82 @@ describe("trigger acceptance persistence", () => {
     assert.equal(expired.status, "dropped");
     if (expired.status !== "dropped") throw new Error("expected an expired-token drop");
     assert.equal(expired.reason, "configuration_unavailable");
+
+    await client.close();
+    await database.close();
+  }, 120_000);
+
+  it("routes Linear agent session events by the team persisted as the receipt resource", async () => {
+    const database = await createDatabase(databaseUrl);
+    const client = await createPostgresQueryRuntime(databaseUrl);
+    const organizationId = "linear-team-org";
+    const projectId = "40000000-0000-4000-8000-000000000011";
+    const connectionId = "40000000-0000-4000-8000-000000000012";
+
+    await client.query(`
+      insert into organization (id, name, slug)
+      values ('${organizationId}', 'Linear Team', 'linear-team');
+      insert into projects (id, organization_id, name, slug)
+      values ('${projectId}', '${organizationId}', 'Default', 'default');
+      insert into linear_connections
+        (id, organization_id, linear_organization_id, provider_application_id, slug,
+         linear_organization_name, app_user_id, access_token, refresh_token, scopes)
+      values
+        ('${connectionId}', '${organizationId}', 'linear-team-workspace', 'linear-app',
+         'linear-team', 'Linear Team', 'linear-app-user', 'linear-access-token',
+         'linear-refresh-token', '["read", "comments:create"]'::jsonb);
+    `);
+    const revision = await database.insertProjectConfigurationRevision({
+      projectId,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "test" },
+      normalizedConfiguration: { environments: [], triggers: [] },
+      contentHash: "linear-team-config",
+    });
+    await database.activateProjectConfigurationRevision(projectId, revision.id, [
+      {
+        provider: "linear",
+        connectionId,
+        resourceId: "team-1",
+        triggerName: "linear-session",
+      },
+    ]);
+
+    const accepted = await database.acceptLinearEvent({
+      linearOrganizationId: "linear-team-workspace",
+      resourceId: "team-1",
+      deliveryId: "linear-agent-session:session-1",
+      source: "linear.agent_session",
+      payload: {},
+      receivedAt: new Date(0),
+    });
+    assert.equal(accepted.status, "accepted");
+    if (accepted.status === "accepted") {
+      assert.deepEqual(
+        accepted.events.map((event) => [event.projectId, event.resourceId]),
+        [[projectId, "team-1"]],
+      );
+    }
+    assert.equal(
+      (
+        await database.findProviderEventReceiptByDeliveryId(
+          "linear-agent-session:session-1",
+          organizationId,
+        )
+      )?.resourceId,
+      "team-1",
+    );
+
+    const otherTeam = await database.acceptLinearEvent({
+      linearOrganizationId: "linear-team-workspace",
+      resourceId: "team-2",
+      deliveryId: "linear-agent-session:session-2",
+      source: "linear.agent_session",
+      payload: {},
+      receivedAt: new Date(1),
+    });
+    assert.equal(otherTeam.status, "dropped");
+    if (otherTeam.status === "dropped") assert.equal(otherTeam.reason, "no_project_route");
 
     await client.close();
     await database.close();

@@ -8,6 +8,12 @@ export interface AgentSessionRecord {
   organizationId: string;
   projectId: string;
   continuationKey: string | null;
+  /**
+   * Groups sessions that share one daemon workspace (for example one Linear issue), independently
+   * of the per-session continuation key. Persisted rows written before the column existed read
+   * back as `null`.
+   */
+  workspaceKey: string | null;
   daemonId: string;
   agentId: string | null;
   workspaceId: string | null;

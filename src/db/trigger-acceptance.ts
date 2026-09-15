@@ -11,6 +11,9 @@ import type {
   GitHubLifecycleReceiptClaim,
   GitHubLifecycleReceiptClaimInput,
   GitHubLifecycleResult,
+  LinearLifecycleReceiptClaim,
+  LinearLifecycleReceiptClaimInput,
+  LinearLifecycleResult,
   ManualEventPersistence,
   PersistManualEventInput,
   ProviderEventAcceptance,
@@ -22,6 +25,7 @@ type HubDatabase = DrizzleHandle;
 type HubTransaction = Parameters<Parameters<HubDatabase["transaction"]>[0]>[0];
 
 const GITHUB_LIFECYCLE = "github_lifecycle";
+const LINEAR_LIFECYCLE = "linear_lifecycle";
 
 export class ProviderEventAcceptanceRepository {
   constructor(
@@ -42,7 +46,7 @@ export class ProviderEventAcceptanceRepository {
   }
 
   acceptLinear(input: AcceptLinearEventInput): Promise<ProviderEventAcceptance> {
-    return this.acceptProvider("linear", input.linearOrganizationId, input.projectId, input);
+    return this.acceptProvider("linear", input.linearOrganizationId, input.resourceId, input);
   }
 
   private async acceptProvider(
@@ -301,6 +305,57 @@ export class ProviderEventAcceptanceRepository {
     await this.database
       .delete(schema.providerEventReceipts)
       .where(eq(schema.providerEventReceipts.id, providerEventReceiptId));
+  }
+
+  claimLinearLifecycleReceipt(
+    input: LinearLifecycleReceiptClaimInput,
+  ): Promise<LinearLifecycleReceiptClaim> {
+    return this.database.transaction(async (transaction) => {
+      const [connection] = await transaction
+        .select({
+          id: schema.linearConnections.id,
+          organizationId: schema.linearConnections.organizationId,
+        })
+        .from(schema.linearConnections)
+        .where(eq(schema.linearConnections.linearOrganizationId, input.linearOrganizationId))
+        .limit(1);
+      if (connection === undefined) return { status: "unbound" };
+      const receipt = await claimProviderReceipt(transaction, {
+        organizationId: connection.organizationId,
+        provider: "linear",
+        connectionId: connection.id,
+        resourceId: null,
+        input: { ...input, dropReason: LINEAR_LIFECYCLE },
+      });
+      if (!receipt.inserted) {
+        return { status: "duplicate", providerEventReceiptId: receipt.id };
+      }
+      return {
+        status: "claimed",
+        providerEventReceiptId: receipt.id,
+        connectionId: connection.id,
+        organizationId: connection.organizationId,
+        linearOrganizationId: input.linearOrganizationId,
+      };
+    });
+  }
+
+  applyLinearLifecycle(
+    claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
+    result: LinearLifecycleResult,
+  ): Promise<void> {
+    return this.connections.applyLinearLifecycle(claim, result, LINEAR_LIFECYCLE);
+  }
+
+  async releaseLinearLifecycleReceipt(providerEventReceiptId: string): Promise<void> {
+    await this.database
+      .delete(schema.providerEventReceipts)
+      .where(
+        and(
+          eq(schema.providerEventReceipts.id, providerEventReceiptId),
+          eq(schema.providerEventReceipts.droppedReason, LINEAR_LIFECYCLE),
+        ),
+      );
   }
 }
 

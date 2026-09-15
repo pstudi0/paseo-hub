@@ -25,6 +25,8 @@ import type {
   GitHubConnectionRecord,
   LinearConnectionRecord,
   LinearConnectionRefreshOperation,
+  LinearLifecycleReceiptClaim,
+  LinearLifecycleResult,
   ReadConnectionAttemptInput,
   SlackConnectionRecord,
   StartConnectionAttemptInput,
@@ -509,6 +511,50 @@ export class ConnectionRepository {
     });
   }
 
+  /**
+   * Applies a claimed Linear lifecycle result. A revocation runs under the same external
+   * connection lock as token refresh and OAuth rebind so a concurrent refresh cannot resurrect
+   * the credentials: the refresh token is cleared and the access token expired, which makes the
+   * connection report `requiresReauthorization`. Team access is stored verbatim.
+   */
+  async applyLinearLifecycle(
+    claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
+    result: LinearLifecycleResult,
+    lifecycleReason: string,
+  ): Promise<void> {
+    if (result.kind === "noop") return;
+    await this.runtime.transaction(async (runtimeTransaction) => {
+      const transaction = runtimeTransaction.drizzle();
+      const [evidence] = await transaction
+        .select({ id: schema.providerEventReceipts.id })
+        .from(schema.providerEventReceipts)
+        .where(
+          and(
+            eq(schema.providerEventReceipts.id, claim.providerEventReceiptId),
+            eq(schema.providerEventReceipts.droppedReason, lifecycleReason),
+          ),
+        )
+        .for("update");
+      if (evidence === undefined) return;
+      if (result.kind === "revoked") {
+        await lockExternal(this.locks, runtimeTransaction, "linear", claim.linearOrganizationId);
+        await transaction
+          .update(schema.linearConnections)
+          .set({
+            refreshToken: null,
+            accessTokenExpiresAt: sql`to_timestamp(0)`,
+            updatedAt: sql`clock_timestamp()`,
+          })
+          .where(eq(schema.linearConnections.id, claim.connectionId));
+        return;
+      }
+      await transaction
+        .update(schema.linearConnections)
+        .set({ teamAccess: result.teamAccess, updatedAt: sql`clock_timestamp()` })
+        .where(eq(schema.linearConnections.id, claim.connectionId));
+    });
+  }
+
   private async bindExclusive(
     input: BindDiscordConnectionInput,
     provider: "discord" | "slack",
@@ -620,6 +666,7 @@ export class ConnectionRepository {
           .select({
             linearOrganizationId: schema.linearConnections.linearOrganizationId,
             accessToken: schema.linearConnections.accessToken,
+            refreshToken: schema.linearConnections.refreshToken,
           })
           .from(schema.linearConnections)
           .where(
@@ -636,10 +683,12 @@ export class ConnectionRepository {
         await transaction
           .delete(schema.linearConnections)
           .where(eq(schema.linearConnections.id, connectionId));
+        // `linear_agent_sessions` cascades on this delete, erasing the timeline mirror.
         return {
           provider,
           linearOrganizationId: connection.linearOrganizationId,
           accessToken: connection.accessToken,
+          refreshToken: connection.refreshToken ?? undefined,
         } as const;
       }
       const [connection] = await transaction
@@ -1134,6 +1183,7 @@ function linearConnection(
     refreshToken: row.refreshToken,
     accessTokenExpiresAt: row.accessTokenExpiresAt,
     scopes: row.scopes,
+    teamAccess: row.teamAccess,
   };
 }
 

@@ -1,4 +1,9 @@
-import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
+import type {
+  AgentExecutionStatus,
+  LINEAR_AGENT_SESSION_STATUSES,
+  MachineSource,
+  MachineStatus,
+} from "./schema.js";
 import type { JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { InvocationRejection } from "../triggers/invocation.js";
@@ -449,6 +454,103 @@ export interface LinearConnectionRecord {
   refreshToken: string | null;
   accessTokenExpiresAt: Date | null;
   scopes: string[];
+  /** Team visibility reported by Linear `PermissionChange` webhooks; null until the first one. */
+  teamAccess: LinearTeamAccess | null;
+}
+
+export interface LinearTeamAccess {
+  canAccessAllPublicTeams: boolean;
+  teamIds: string[];
+  updatedAt: string;
+}
+
+export type LinearAgentSessionMirrorStatus = (typeof LINEAR_AGENT_SESSION_STATUSES)[number];
+
+/** A Paseo permission request mirrored into Linear as a `select` elicitation, awaiting its answer. */
+export interface LinearPendingPermission {
+  /** `AgentPermissionRequest.id` on the Paseo daemon. */
+  requestId: string;
+  agentId: string;
+  executionId: string;
+  /** The elicitation activity emitted in Linear. */
+  activityId: string;
+  options: readonly {
+    value: string;
+    label: string;
+    behavior: "allow" | "deny";
+    selectedActionId?: string;
+    forSession?: boolean;
+  }[];
+  /** `AgentPermissionRequest.suggestions`, replayed verbatim with the answer. */
+  suggestions: readonly Record<string, unknown>[];
+}
+
+/** A `prompted` activity received while the session had no execution able to take it. */
+export interface LinearPendingPrompt {
+  activityId: string;
+  body: string;
+  receivedAt: string;
+}
+
+export interface LinearAgentSessionRecord {
+  id: string;
+  organizationId: string;
+  linearConnectionId: string;
+  linearOrganizationId: string;
+  linearSessionId: string;
+  issueId: string;
+  issueIdentifier: string | null;
+  teamId: string;
+  /** Hub project selected at matching time; null until a trigger matched. */
+  projectId: string | null;
+  /** Hub agent session bound to this Linear session. */
+  agentSessionId: string | null;
+  currentExecutionId: string | null;
+  daemonId: string | null;
+  daemonAgentId: string | null;
+  daemonWorkspaceId: string | null;
+  mirrorStatus: LinearAgentSessionMirrorStatus;
+  /** Last `response`/`error` activity of the current turn. */
+  respondedAt: Date | null;
+  lastActivityId: string | null;
+  lastActivityAt: Date | null;
+  /** Last `assistant_message` of the current turn. */
+  lastAssistantMessage: string | null;
+  /** Pull request URL published to Linear exactly once. */
+  pullRequestUrl: string | null;
+  pendingPermission: LinearPendingPermission | null;
+  pendingPrompts: readonly LinearPendingPrompt[];
+  stopRequestedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface UpsertLinearAgentSessionInput {
+  organizationId: string;
+  linearConnectionId: string;
+  linearOrganizationId: string;
+  linearSessionId: string;
+  issueId: string;
+  issueIdentifier?: string | null;
+  teamId: string;
+}
+
+/** Partial update: an absent key is left unchanged, `null` clears the column. */
+export interface LinearAgentSessionPatch {
+  projectId?: string | null;
+  agentSessionId?: string | null;
+  currentExecutionId?: string | null;
+  daemonId?: string | null;
+  daemonAgentId?: string | null;
+  daemonWorkspaceId?: string | null;
+  mirrorStatus?: LinearAgentSessionMirrorStatus;
+  respondedAt?: Date | null;
+  lastActivityId?: string | null;
+  lastActivityAt?: Date | null;
+  lastAssistantMessage?: string | null;
+  pullRequestUrl?: string | null;
+  pendingPermission?: LinearPendingPermission | null;
+  stopRequestedAt?: Date | null;
 }
 
 export interface StartConnectionAttemptInput {
@@ -553,9 +655,15 @@ export type DisconnectConnectionResult =
       botAccessToken: string | undefined;
     }
   | {
+      /**
+       * Deleting the connection cascades to `linear_agent_sessions`, so the timeline mirror of
+       * every Linear agent session of that workspace is erased with it. Both tokens are returned
+       * for revocation.
+       */
       provider: "linear";
       linearOrganizationId: string | undefined;
       accessToken: string | undefined;
+      refreshToken: string | undefined;
     };
 
 export type GitHubLifecycleIdentity = Omit<
@@ -630,7 +738,11 @@ export interface AcceptSlackEventInput extends ProviderEventEvidence {
 
 export interface AcceptLinearEventInput extends ProviderEventEvidence {
   linearOrganizationId: string;
-  projectId?: string;
+  /**
+   * Route selector persisted as the receipt `resource_id`: the Linear project for `linear.issue`
+   * and `linear.comment`, the Linear team for `linear.agent_session`.
+   */
+  resourceId?: string;
 }
 
 export interface PersistManualEventInput extends InsertProviderEventInput {
@@ -658,6 +770,32 @@ export type GitHubLifecycleReceiptClaim =
 export type GitHubLifecycleResult =
   | { status: "absent"; removeBinding: boolean }
   | { status: "present"; identity: GitHubLifecycleIdentity };
+
+export interface LinearLifecycleReceiptClaimInput {
+  linearOrganizationId: string;
+  deliveryId: string;
+  signatureHash: string;
+  /** `linear.permission_change` | `linear.oauth_app` | `linear.notification` */
+  source: string;
+  payload: unknown;
+  receivedAt: Date;
+}
+
+export type LinearLifecycleReceiptClaim =
+  | {
+      status: "claimed";
+      providerEventReceiptId: string;
+      connectionId: string;
+      organizationId: string;
+      linearOrganizationId: string;
+    }
+  | { status: "duplicate"; providerEventReceiptId: string }
+  | { status: "unbound" };
+
+export type LinearLifecycleResult =
+  | { kind: "revoked" }
+  | { kind: "team_access"; teamAccess: LinearTeamAccess }
+  | { kind: "noop" };
 
 export interface InsertMachineInput {
   orgId: string;
@@ -1166,6 +1304,55 @@ export interface Database {
     action?: import("../agent-sessions/index.js").AgentSessionAction,
   ): Promise<void>;
   listAgentSessionExecutions(sessionId: string): Promise<AgentExecutionRecord[]>;
+  /** Sessions sharing a workspace key within a project, most recently created first. */
+  findAgentSessionsByWorkspaceKey(
+    projectId: string,
+    workspaceKey: string,
+  ): Promise<import("../agent-sessions/index.js").AgentSessionRecord[]>;
+
+  /**
+   * Registers a Linear agent session once: a replayed `created` webhook returns the existing row
+   * untouched with `created: false`.
+   */
+  upsertLinearAgentSession(
+    input: UpsertLinearAgentSessionInput,
+  ): Promise<{ record: LinearAgentSessionRecord; created: boolean }>;
+  findLinearAgentSession(linearSessionId: string): Promise<LinearAgentSessionRecord | undefined>;
+  /** Sessions of one Linear issue, most recently created first. */
+  listLinearAgentSessionsForIssue(
+    linearOrganizationId: string,
+    issueId: string,
+  ): Promise<LinearAgentSessionRecord[]>;
+  /** Applies `patch` atomically (absent key unchanged, `null` clears); undefined when unknown. */
+  updateLinearAgentSession(
+    linearSessionId: string,
+    patch: LinearAgentSessionPatch,
+  ): Promise<LinearAgentSessionRecord | undefined>;
+  appendLinearPendingPrompt(
+    linearSessionId: string,
+    prompt: LinearPendingPrompt,
+  ): Promise<LinearAgentSessionRecord | undefined>;
+  /** Returns the queued prompts and empties the queue in the same statement. */
+  takeLinearPendingPrompts(linearSessionId: string): Promise<LinearPendingPrompt[]>;
+  /**
+   * Durably claims a Linear lifecycle delivery (permission change, OAuth revocation,
+   * notification) for the connection bound to `linearOrganizationId`, mirroring
+   * `claimGitHubLifecycleReceipt`.
+   */
+  claimLinearLifecycleReceipt(
+    input: LinearLifecycleReceiptClaimInput,
+  ): Promise<LinearLifecycleReceiptClaim>;
+  /**
+   * Applies a claimed lifecycle result: `revoked` clears the refresh token and expires the access
+   * token under the external-connection lock so the connection reports
+   * `requiresReauthorization`; `team_access` stores the team visibility; `noop` changes nothing.
+   */
+  applyLinearLifecycle(
+    claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
+    result: LinearLifecycleResult,
+  ): Promise<void>;
+  releaseLinearLifecycleReceipt(providerEventReceiptId: string): Promise<void>;
+  findOrganizationSlug(organizationId: string): Promise<string | undefined>;
 
   createAcceptedTriggerRun(
     input: CreateAcceptedTriggerRunInput,
