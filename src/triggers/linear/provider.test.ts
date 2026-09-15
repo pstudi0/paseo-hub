@@ -598,6 +598,7 @@ describe("Linear agent session trigger provider", () => {
           linearOrganizationId: LINEAR_FIXTURE.organizationId,
           agentSessionId: LINEAR_FIXTURE.sessionId,
           beforeCreatedAt: triggerAt,
+          excludeActivityId: LINEAR_FIXTURE.promptActivityId,
         },
       },
       {
@@ -854,6 +855,7 @@ class RecordingSessionClient implements Partial<
     linearOrganizationId: string;
     agentSessionId: string;
     beforeCreatedAt: string;
+    excludeActivityId: string | null;
   }): Promise<LinearAgentSessionActivityHistory> {
     this.reads.push({ method: "readAgentSessionActivities", input });
     if (this.failures.activities !== undefined) return Promise.reject(this.failures.activities);
