@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { logger } from "../../logger.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
 import type { LinearSessionSource } from "../configuration/events.js";
 
@@ -134,6 +135,7 @@ export type NormalizedLinearEvent = z.infer<typeof NormalizedLinearEventSchema>;
 export type NormalizedLinearSessionIssue = NonNullable<
   NormalizedLinearAgentSessionEvent["session"]["issue"]
 >;
+export type NormalizedLinearThreadComment = z.infer<typeof LinearThreadCommentSchema>;
 
 /**
  * Linear's webhook data follows its entity model but not every event embeds related objects. This
@@ -179,15 +181,29 @@ export function eventRouteResourceId(event: NormalizedLinearEvent): string | und
  */
 export function linearSessionSource(event: NormalizedLinearAgentSessionEvent): LinearSessionSource {
   const { session } = event;
-  const humanRootComment =
-    session.comment !== null &&
-    session.comment.userId !== null &&
-    session.comment.userId !== event.appUserId &&
-    session.comment.body.trim() !== "";
-  if (event.previousComments.length > 0 || session.sourceCommentId !== null || humanRootComment) {
+  if (
+    event.previousComments.length > 0 ||
+    session.sourceCommentId !== null ||
+    humanRootComment(event) !== null
+  ) {
     return "mention";
   }
   return session.creator === null ? "automation" : "delegation";
+}
+
+/**
+ * The root comment of the session's thread when a human wrote it: the one text of a new session
+ * that is the human's own words. Linear's artificial root comment (absent author, the app user,
+ * or a blank body) is never treated as such, so it is neither mention evidence nor parser input.
+ */
+export function humanRootComment(
+  event: NormalizedLinearAgentSessionEvent,
+): NormalizedLinearThreadComment | null {
+  const comment = event.session.comment;
+  if (comment === null || comment.userId === null || comment.userId === event.appUserId) {
+    return null;
+  }
+  return comment.body.trim() === "" ? null : comment;
 }
 
 interface LinearEnvelope {
@@ -280,7 +296,9 @@ function normalizeCommentEvent(
  * Built by hand rather than parsed directly: Linear omits unset relations instead of sending
  * `null`, and the normalized payload commits to `null` for every one of them. A payload missing a
  * field the SDL declares non-null is not a session event Hub understands and normalizes to
- * `undefined`, like an issue without a title.
+ * `undefined`, like an issue without a title. The final schema check catches what the field
+ * readers cannot (a malformed URL, an unknown guidance origin) and answers the same way: a
+ * delivery that will never parse is ignored, not retried.
  */
 function normalizeAgentSessionEvent(
   payload: Record<string, unknown>,
@@ -310,7 +328,7 @@ function normalizeAgentSessionEvent(
   const activity =
     action === "prompted" ? normalizeAgentActivity(asRecord(payload["agentActivity"])) : null;
   if (activity === undefined) return undefined;
-  return NormalizedLinearAgentSessionEventSchema.parse({
+  const normalized = NormalizedLinearAgentSessionEventSchema.safeParse({
     type: "agent_session",
     action,
     id: activity === null ? session.id : activity.id,
@@ -324,6 +342,15 @@ function normalizeAgentSessionEvent(
     activity,
     occurredAt,
   });
+  if (normalized.success) return normalized.data;
+  logger.info(
+    {
+      agentSessionId: session.id,
+      issues: normalized.error.issues.map((issue) => issue.path.join(".")),
+    },
+    "ignoring malformed Linear agent session event",
+  );
+  return undefined;
 }
 
 function normalizeAgentSession(

@@ -3,6 +3,7 @@ import type {
   TriggerFilter,
 } from "../../config/index.js";
 import {
+  humanRootComment,
   linearSessionSource,
   type NormalizedLinearAgentSessionEvent,
   type NormalizedLinearCommentEvent,
@@ -23,7 +24,8 @@ export interface MatchedLinearTrigger {
  * command marker. A command `pattern` is consumed only at a boundary; a `contains` marker is
  * then found in the remaining tail. Input-shaped markers such as `repo=hub` remain in the parser
  * text. A session prompt parses like a comment; a created session parses its mention comment
- * when there is one and nothing otherwise: `promptContext` is Linear's rendering, never input.
+ * when a human wrote one and nothing otherwise: neither `promptContext` nor Linear's artificial
+ * root comment is human input.
  */
 export function readLinearInvocationParserMessage(
   event: NormalizedLinearCommentEvent | NormalizedLinearAgentSessionEvent,
@@ -110,7 +112,7 @@ function invocationBody(
 ): string {
   if (event.type === "comment") return event.comment.body;
   if (event.activity !== null) return event.activity.body;
-  return event.session.comment?.body ?? "";
+  return humanRootComment(event)?.body ?? "";
 }
 
 function matchesLinearEvent(eventName: string, event: NormalizedLinearEvent): boolean {

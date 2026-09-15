@@ -115,6 +115,15 @@ async function handoffLinearEvent(
       logger.info({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
       return new Response("OK", { status: 200 });
     }
+    // A session is routed by its issue's team; without an issue there is nothing to hydrate,
+    // serve, or retry.
+    if (event.type === "agent_session" && event.session.issue === null) {
+      logger.info(
+        { deliveryId: verified.deliveryId, agentSessionId: event.session.id },
+        "ignoring Linear agent session without issue",
+      );
+      return new Response("OK", { status: 200 });
+    }
     if (eventRouteResourceId(event) === undefined && options.resolveIssue !== undefined) {
       const source = linearEventSource(event);
       if (

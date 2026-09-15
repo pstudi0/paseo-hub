@@ -270,6 +270,13 @@ describe("Linear agent session normalization", () => {
     assert.equal(normalizeLinearEvent(payload), undefined);
   });
 
+  it("ignores a session delivery that fails the final schema check instead of throwing", () => {
+    const payload = readLinearFixture("linear-agent-session-created");
+    fixtureRecord(payload["agentSession"])["url"] = "";
+
+    assert.equal(normalizeLinearEvent(payload), undefined);
+  });
+
   it("keeps a session without an issue but gives it no route and no issue", () => {
     const payload = readLinearFixture("linear-agent-session-created");
     delete fixtureRecord(payload["agentSession"])["issue"];

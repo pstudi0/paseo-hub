@@ -8,6 +8,9 @@ import type {
   LinearIssueDetails,
 } from "../../providers/linear/client.js";
 import { createMemoryDatabase } from "../../db/memory.js";
+import { runWithFailureTracking } from "../../failures/index.js";
+import { createLogger } from "../../logger.js";
+import { assertOneFailure, FailureLogStream } from "../../test-utils/failure-logs.js";
 import {
   LINEAR_FIXTURE,
   readLinearFixture,
@@ -735,35 +738,64 @@ describe("Linear agent session trigger provider", () => {
     });
   });
 
-  it("keeps a session run usable when history or issue hydration fails", async () => {
-    const { project, revision, store } = await activeConfiguration(linearSessionConfiguration());
-    const failing = new RecordingSessionClient(undefined, new Error("Linear unavailable"));
-    const provider = createLinearTriggerProvider({
-      configurationStoreForProject: () => store,
-      client: failing,
-    });
-    const match = (
-      await provider.match(
-        sessionExternal(project.id, revision.id, session("linear-agent-session-prompted")),
-      )
-    )[0];
-    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+  it.each([
+    ["the session history", { activities: true }],
+    ["the issue", { issue: true }],
+  ] as const)(
+    "keeps a session run usable and reports the failure when reading %s fails",
+    async (_subject, failing) => {
+      const { project, revision, store } = await activeConfiguration(linearSessionConfiguration());
+      const canary = "linear-session-secret-7d21";
+      const client = new RecordingSessionClient(
+        { activities: { complete: true, activities: [] } },
+        {
+          ...("activities" in failing ? { activities: new Error(canary) } : {}),
+          ...("issue" in failing ? { issue: new Error(canary) } : {}),
+        },
+      );
+      const provider = createLinearTriggerProvider({
+        configurationStoreForProject: () => store,
+        client,
+      });
+      const match = (
+        await provider.match(
+          sessionExternal(project.id, revision.id, session("linear-agent-session-prompted")),
+        )
+      )[0];
+      if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
 
-    const context = await provider.materializeContext!({
-      executionId: "execution-linear-session-unavailable",
-      organizationId: "hub-org",
-      projectId: project.id,
-      providerEventReceiptId: "11111111-1111-4111-8111-111111111133",
-      triggerContext: match.triggerContext,
-    });
-    const linear = sessionContext(context.linear);
+      const stream = new FailureLogStream();
+      const context = await runWithFailureTracking(
+        () =>
+          provider.materializeContext!({
+            executionId: "execution-linear-session-unavailable",
+            organizationId: "hub-org",
+            projectId: project.id,
+            providerEventReceiptId: "11111111-1111-4111-8111-111111111133",
+            triggerContext: match.triggerContext,
+          }),
+        createLogger(stream),
+      );
+      const linear = sessionContext(context.linear);
 
-    assert.deepEqual(linear.thread, { status: "unavailable", messages: [] });
-    assert.equal(linear.issue.project, null);
-    assert.equal(linear.session.id, LINEAR_FIXTURE.sessionId);
-  });
+      assert.deepEqual(linear.thread, { status: "unavailable", messages: [] });
+      assert.equal(linear.issue.project, null);
+      assert.equal(linear.session.id, LINEAR_FIXTURE.sessionId);
+      const record = assertOneFailure(stream, {
+        operation: "linear.agent_session.history.hydrate",
+        component: "triggers",
+        canary,
+      });
+      assert.equal(record["provider"], "linear");
+      assert.deepEqual(record["diagnostic"], {
+        linearOrganizationId: LINEAR_FIXTURE.organizationId,
+        issueId: LINEAR_FIXTURE.issueId,
+        sessionId: LINEAR_FIXTURE.sessionId,
+      });
+    },
+  );
 
-  it("leaves a follow-up's history unavailable without a client able to read activities", async () => {
+  it("knows a new session's history is empty but not a follow-up's without a client", async () => {
     const { project, revision, store } = await activeConfiguration(linearSessionConfiguration());
     for (const client of [
       undefined,
@@ -773,25 +805,37 @@ describe("Linear agent session trigger provider", () => {
         configurationStoreForProject: () => store,
         ...(client === undefined ? {} : { client }),
       });
-      const match = (
-        await provider.match(
-          sessionExternal(project.id, revision.id, session("linear-agent-session-prompted")),
-        )
-      )[0];
-      if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+      const materialize = async (fixture: LinearFixtureName) => {
+        const match = (
+          await provider.match(sessionExternal(project.id, revision.id, session(fixture)))
+        )[0];
+        if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+        const context = await provider.materializeContext!({
+          executionId: "execution-linear-session-no-client",
+          organizationId: "hub-org",
+          projectId: project.id,
+          providerEventReceiptId: "11111111-1111-4111-8111-111111111134",
+          triggerContext: match.triggerContext,
+        });
+        return sessionContext(context.linear);
+      };
 
-      const context = await provider.materializeContext!({
-        executionId: "execution-linear-session-no-client",
-        organizationId: "hub-org",
-        projectId: project.id,
-        providerEventReceiptId: "11111111-1111-4111-8111-111111111134",
-        triggerContext: match.triggerContext,
+      const created = await materialize("linear-agent-session-created");
+      assert.deepEqual(created.thread, { status: "available", messages: [] });
+      assert.deepEqual(created.issue, {
+        id: LINEAR_FIXTURE.issueId,
+        identifier: "LAB-42",
+        title: "Fix the flaky daemon reconnect test",
+        description: "The reconnect test fails once every ~20 runs on CI.",
+        url: "https://linear.app/lab/issue/LAB-42/fix-the-flaky-daemon-reconnect-test",
+        project: null,
+        state: null,
+        assignee: null,
+        label_ids: [],
       });
 
-      assert.deepEqual(sessionContext(context.linear).thread, {
-        status: "unavailable",
-        messages: [],
-      });
+      const prompted = await materialize("linear-agent-session-prompted");
+      assert.deepEqual(prompted.thread, { status: "unavailable", messages: [] });
     }
   });
 });
@@ -805,7 +849,7 @@ class RecordingSessionClient implements Partial<
     private readonly responses:
       | { activities?: LinearAgentSessionActivityHistory; issue?: LinearIssueDetails }
       | undefined = {},
-    private readonly error?: Error,
+    private readonly failures: { activities?: Error; issue?: Error } = {},
   ) {}
 
   readAgentSessionActivities(input: {
@@ -814,7 +858,7 @@ class RecordingSessionClient implements Partial<
     beforeCreatedAt: string;
   }): Promise<LinearAgentSessionActivityHistory> {
     this.reads.push({ method: "readAgentSessionActivities", input });
-    if (this.error !== undefined) return Promise.reject(this.error);
+    if (this.failures.activities !== undefined) return Promise.reject(this.failures.activities);
     if (this.responses?.activities === undefined) {
       return Promise.reject(new Error("activities were not configured"));
     }
@@ -826,7 +870,7 @@ class RecordingSessionClient implements Partial<
     issueId: string;
   }): Promise<LinearIssueDetails | undefined> {
     this.reads.push({ method: "readIssue", input });
-    if (this.error !== undefined) return Promise.reject(this.error);
+    if (this.failures.issue !== undefined) return Promise.reject(this.failures.issue);
     return Promise.resolve(this.responses?.issue);
   }
 }

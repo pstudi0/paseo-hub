@@ -387,9 +387,10 @@ async function materializeIssueContext(
 }
 
 /**
- * A new session has no history of its own: its prompt context already renders the issue and
- * thread, so only the issue is hydrated. A follow-up reads the session's conversation strictly
- * before the prompt that triggered it. Either way, a failure leaves the run usable.
+ * A new session has no history of its own: its thread is known to be empty without any read, and
+ * its prompt context already renders the issue and thread, so only the issue is hydrated. A
+ * follow-up reads the session's conversation strictly before the prompt that triggered it, which
+ * takes a client. Either way, a failure leaves the run usable.
  */
 async function materializeSessionContext(
   context: LinearSessionEventContext,
@@ -399,12 +400,14 @@ async function materializeSessionContext(
   const unavailable = (): LinearMaterializedContext => ({
     linear: { ...linear, thread: { status: "unavailable", messages: [] } },
   });
-  if (locator.status !== "deferred" || client === undefined) return unavailable();
+  if (locator.status !== "deferred") return unavailable();
   try {
-    const thread =
-      linear.action === "prompted"
-        ? await sessionThreadContext(client, linear.organization.id, locator)
-        : { status: "available" as const, messages: [] };
+    if (linear.action === "created") {
+      const issue = await hydrateSessionIssue(client, linear.organization.id, linear.issue);
+      return { linear: { ...linear, issue, thread: { status: "available", messages: [] } } };
+    }
+    if (client === undefined) return unavailable();
+    const thread = await sessionThreadContext(client, linear.organization.id, locator);
     if (thread === undefined) return unavailable();
     const issue = await hydrateSessionIssue(client, linear.organization.id, linear.issue);
     return { linear: { ...linear, issue, thread } };
@@ -458,12 +461,13 @@ async function sessionThreadContext(
   return { status: complete ? "available" : "incomplete", messages };
 }
 
+/** The issue as delivered when nothing can read it; never a fabricated state or assignee. */
 async function hydrateSessionIssue(
-  client: LinearContextClient,
+  client: LinearContextClient | undefined,
   linearOrganizationId: string,
   issue: LinearSessionEventContext["issue"],
 ): Promise<LinearMaterializedSessionIssue> {
-  if (client.readIssue === undefined) return issue;
+  if (client?.readIssue === undefined) return issue;
   const details = await client.readIssue({ linearOrganizationId, issueId: issue.id });
   if (details === undefined) return issue;
   return {

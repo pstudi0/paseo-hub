@@ -302,6 +302,24 @@ describe("Linear agent session matching", () => {
       "add a regression test, priority=high",
     );
   });
+
+  it("never parses a root comment Linear wrote as the app user, only a human's", () => {
+    const created = session("linear-agent-session-created");
+    const rootComment = (userId: string | null) => ({
+      ...created,
+      session: { ...created.session, comment: { id: "root", body: "priority=high", userId } },
+    });
+
+    assert.equal(
+      readLinearInvocationParserMessage(rootComment(LINEAR_FIXTURE.appUserId), undefined),
+      "",
+    );
+    assert.equal(readLinearInvocationParserMessage(rootComment(null), undefined), "");
+    assert.equal(
+      readLinearInvocationParserMessage(rootComment(LINEAR_FIXTURE.humanId), undefined),
+      "priority=high",
+    );
+  });
 });
 
 describe("Linear comment invocation parser handoff", () => {
