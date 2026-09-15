@@ -11,7 +11,13 @@ import {
   createLinearApiClient,
   createLinearConnectionClient,
   hasRequiredLinearScopes,
+  LINEAR_REQUIRED_SCOPES,
+  LinearApiError,
+  type LinearApiClient,
 } from "./client.js";
+
+const AGENT_SCOPE_PARAMETER = "read,write,comments:create,app:assignable,app:mentionable";
+const GRANTED_SCOPES = ["app:assignable", "app:mentionable", "comments:create", "read", "write"];
 
 describe("Linear connection client", () => {
   it("uses an OAuth callback URL and records the installed workspace identity", async () => {
@@ -29,7 +35,7 @@ describe("Linear connection client", () => {
             access_token: "access-token",
             refresh_token: "refresh-token",
             expires_in: 3600,
-            scope: "read,comments:create",
+            scope: AGENT_SCOPE_PARAMETER,
           });
         }
         return json({
@@ -44,7 +50,7 @@ describe("Linear connection client", () => {
       authorization.searchParams.get("redirect_uri"),
       "https://hub.test/api/integrations/linear/callback",
     );
-    assert.equal(authorization.searchParams.get("scope"), "read,comments:create");
+    assert.equal(authorization.searchParams.get("scope"), AGENT_SCOPE_PARAMETER);
     assert.equal(authorization.searchParams.get("actor"), "app");
     assert.equal(authorization.searchParams.get("state"), "state-value");
 
@@ -55,9 +61,55 @@ describe("Linear connection client", () => {
       accessToken: "access-token",
       refreshToken: "refresh-token",
       accessTokenExpiresAt: new Date(1_700_003_600_000),
-      scopes: ["comments:create", "read"],
+      scopes: GRANTED_SCOPES,
     });
     assert.match(requests[0]?.body ?? "", /code=code-value/u);
+  });
+
+  it("accepts the granted scopes as an array from applications created before December 2023", async () => {
+    const client = createLinearConnectionClient({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      publicBaseUrl: "https://hub.test",
+      fetch: async (url) => {
+        if (readableUrl(url).endsWith("/oauth/token")) {
+          return json({
+            access_token: "access-token",
+            scope: ["read", "write", "comments:create", "app:assignable", "app:mentionable"],
+          });
+        }
+        return json({
+          data: { viewer: { id: "app-user", organization: { id: "linear-org", name: "Acme" } } },
+        });
+      },
+    });
+
+    const installation = await client.exchangeCode("code-value");
+
+    assert.deepEqual(installation.scopes, GRANTED_SCOPES);
+  });
+
+  it("revokes the refresh token alongside the access token", async () => {
+    const bodies: string[] = [];
+    const client = createLinearConnectionClient({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      publicBaseUrl: "https://hub.test",
+      fetch: async (url, init) => {
+        assert.equal(readableUrl(url), "https://api.linear.app/oauth/revoke");
+        bodies.push(readableBody(init?.body));
+        return new Response(null, { status: 200 });
+      },
+    });
+
+    await client.revoke("access-token", "refresh-token");
+    await client.revoke("only-access-token");
+
+    assert.deepEqual(bodies, [
+      "client_id=client-id&client_secret=client-secret&token=access-token&token_type_hint=access_token",
+      "client_id=client-id&client_secret=client-secret&token=refresh-token&token_type_hint=refresh_token",
+      "client_id=client-id&client_secret=client-secret&token=only-access-token&token_type_hint=access_token",
+    ]);
   });
 
   it("keeps requested scopes when Linear omits them during authorization", async () => {
@@ -77,7 +129,7 @@ describe("Linear connection client", () => {
 
     const installation = await client.exchangeCode("code-value");
 
-    assert.deepEqual(installation.scopes, ["read", "comments:create"]);
+    assert.deepEqual(installation.scopes, [...LINEAR_REQUIRED_SCOPES]);
   });
 
   it("reads a bounded, chronological history before the triggering comment", async () => {
@@ -485,11 +537,576 @@ describe("Linear connection client", () => {
     assert.deepEqual(requests, ["Bearer fresh-token", "Bearer fresh-token"]);
   });
 
-  it("requires read access and the narrow comment-creation scope", () => {
-    assert.equal(hasRequiredLinearScopes(["read", "comments:create"]), true);
-    assert.equal(hasRequiredLinearScopes(["read"]), false);
+  it("requires every agent scope, so pre-agent connections must be authorized again", () => {
+    assert.equal(hasRequiredLinearScopes(GRANTED_SCOPES), true);
+    assert.equal(hasRequiredLinearScopes(["read", "comments:create"]), false);
+    assert.equal(
+      hasRequiredLinearScopes(["read", "write", "comments:create", "app:assignable"]),
+      false,
+    );
   });
 });
+
+describe("Linear API client contracts", () => {
+  it("reads an issue with its branch, team, workflow state, and delegate", async () => {
+    const { api, requests } = apiClient(() =>
+      json({
+        data: {
+          issue: {
+            id: "issue-1",
+            identifier: "ENG-42",
+            title: "Fix login",
+            description: null,
+            url: "https://linear.app/acme/issue/ENG-42",
+            branchName: "acme/eng-42-fix-login",
+            team: { id: "team-1", key: "ENG", name: "Engineering" },
+            project: null,
+            state: { id: "state-1", name: "Todo", type: "unstarted" },
+            assignee: { id: "user-1" },
+            delegate: null,
+            labels: { nodes: [{ id: "label-1" }] },
+          },
+        },
+      }),
+    );
+
+    const issue = await api.readIssue({ linearOrganizationId: "linear-org", issueId: "issue-1" });
+
+    assert.deepEqual(issue, {
+      id: "issue-1",
+      identifier: "ENG-42",
+      title: "Fix login",
+      description: null,
+      url: "https://linear.app/acme/issue/ENG-42",
+      branchName: "acme/eng-42-fix-login",
+      teamId: "team-1",
+      team: { id: "team-1", key: "ENG", name: "Engineering" },
+      projectId: null,
+      stateId: "state-1",
+      state: { id: "state-1", name: "Todo", type: "unstarted" },
+      assigneeId: "user-1",
+      delegateId: null,
+      labelIds: ["label-1"],
+    });
+    const request = graphqlRequest(requests[0]!.body);
+    for (const field of [
+      "branchName",
+      "team { id key name }",
+      "state { id name type }",
+      "delegate { id }",
+    ]) {
+      assert.ok(request.query.includes(field), `query lacks ${field}`);
+    }
+    assert.deepEqual(request.variables, { id: "issue-1" });
+  });
+
+  it("creates an agent activity with the caller's id, signal, and metadata", async () => {
+    const { api, requests } = apiClient(() =>
+      json({
+        data: {
+          agentActivityCreate: { success: true, agentActivity: { id: "activity-1" } },
+        },
+      }),
+    );
+
+    const created = await api.createAgentActivity({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      id: "5f0c7c7e-2c2a-4c6d-9a53-6f2a9d6b1c01",
+      content: { type: "elicitation", body: "Which branch?" },
+      ephemeral: true,
+      signal: "select",
+      signalMetadata: { options: [{ id: "main", label: "main" }] },
+    });
+
+    assert.deepEqual(created, { id: "activity-1" });
+    const request = graphqlRequest(requests[0]!.body);
+    assert.match(
+      request.query,
+      /mutation PaseoAgentActivityCreate\(\$input: AgentActivityCreateInput!\)/u,
+    );
+    assert.match(
+      request.query,
+      /agentActivityCreate\(input: \$input\) \{ success agentActivity \{ id \} \}/u,
+    );
+    assert.deepEqual(request.variables, {
+      input: {
+        agentSessionId: "session-1",
+        id: "5f0c7c7e-2c2a-4c6d-9a53-6f2a9d6b1c01",
+        content: { type: "elicitation", body: "Which branch?" },
+        ephemeral: true,
+        signal: "select",
+        signalMetadata: { options: [{ id: "main", label: "main" }] },
+      },
+    });
+  });
+
+  it("omits every optional activity field it was not given", async () => {
+    const { api, requests } = apiClient(() =>
+      json({
+        data: {
+          agentActivityCreate: { success: true, agentActivity: { id: "activity-2" } },
+        },
+      }),
+    );
+
+    await api.createAgentActivity({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "action", action: "Read", parameter: "src/app.ts", result: "120 lines" },
+    });
+
+    assert.deepEqual(graphqlRequest(requests[0]!.body).variables, {
+      input: {
+        agentSessionId: "session-1",
+        content: { type: "action", action: "Read", parameter: "src/app.ts", result: "120 lines" },
+      },
+    });
+  });
+
+  it("rejects an activity Linear did not accept", async () => {
+    const { api } = apiClient(() =>
+      json({
+        data: {
+          agentActivityCreate: { success: false, agentActivity: { id: "activity-3" } },
+        },
+      }),
+    );
+
+    await assert.rejects(
+      api.createAgentActivity({
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        content: { type: "thought", body: "Looking" },
+      }),
+      /Linear agent activity was not accepted/u,
+    );
+  });
+
+  it("updates a session's plan, links, and summary without replacing its other links", async () => {
+    const { api, requests } = apiClient(() =>
+      json({ data: { agentSessionUpdate: { success: true } } }),
+    );
+
+    await api.updateAgentSession({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      plan: [
+        { content: "Reproduce", status: "completed" },
+        { content: "Fix", status: "inProgress" },
+      ],
+      addedExternalUrls: [{ label: "Paseo", url: "https://hub.test/o/acme/activity" }],
+      removedExternalUrls: ["https://hub.test/old"],
+      summary: "Fix login",
+    });
+
+    const request = graphqlRequest(requests[0]!.body);
+    assert.match(
+      request.query,
+      /mutation PaseoAgentSessionUpdate\(\$id: String!, \$input: AgentSessionUpdateInput!\)/u,
+    );
+    assert.match(request.query, /agentSessionUpdate\(id: \$id, input: \$input\) \{ success \}/u);
+    assert.deepEqual(request.variables, {
+      id: "session-1",
+      input: {
+        plan: [
+          { content: "Reproduce", status: "completed" },
+          { content: "Fix", status: "inProgress" },
+        ],
+        addedExternalUrls: [{ label: "Paseo", url: "https://hub.test/o/acme/activity" }],
+        removedExternalUrls: ["https://hub.test/old"],
+        summary: "Fix login",
+      },
+    });
+    assert.ok(!request.query.includes("externalUrls:"), "externalUrls replaces every link");
+    assert.ok(!request.query.includes("externalLink"), "externalLink replaces every link");
+  });
+
+  it("sends only the session fields it was given", async () => {
+    const { api, requests } = apiClient(() =>
+      json({ data: { agentSessionUpdate: { success: true } } }),
+    );
+
+    await api.updateAgentSession({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      summary: "Only the title",
+    });
+
+    assert.deepEqual(graphqlRequest(requests[0]!.body).variables, {
+      id: "session-1",
+      input: { summary: "Only the title" },
+    });
+  });
+
+  it("reads a session's status and issue", async () => {
+    const { api, requests } = apiClient(() =>
+      json({
+        data: {
+          agentSession: {
+            id: "session-1",
+            status: "awaitingInput",
+            summary: null,
+            url: "https://linear.app/acme/issue/ENG-42#session-1",
+            issue: { id: "issue-1", identifier: "ENG-42" },
+          },
+        },
+      }),
+    );
+
+    const session = await api.readAgentSession({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+    });
+
+    assert.deepEqual(session, {
+      id: "session-1",
+      status: "awaitingInput",
+      summary: null,
+      url: "https://linear.app/acme/issue/ENG-42#session-1",
+      issue: { id: "issue-1", identifier: "ENG-42" },
+    });
+    const request = graphqlRequest(requests[0]!.body);
+    assert.match(
+      request.query,
+      /agentSession\(id: \$id\) \{ id status summary url issue \{ id identifier \} \}/u,
+    );
+    assert.deepEqual(request.variables, { id: "session-1" });
+  });
+
+  it("returns undefined for a session Linear no longer has", async () => {
+    const { api } = apiClient(() => json({ data: { agentSession: null } }));
+
+    assert.equal(
+      await api.readAgentSession({ linearOrganizationId: "linear-org", agentSessionId: "gone" }),
+      undefined,
+    );
+  });
+
+  it("reads a bounded, chronological activity history before a point in time", async () => {
+    const { api, requests } = apiClient(() =>
+      json({
+        data: {
+          agentSession: {
+            activities: {
+              nodes: [
+                {
+                  id: "activity-3",
+                  createdAt: "2023-11-14T22:13:19.003Z",
+                  signal: null,
+                  user: { id: "app-user", name: "Paseo" },
+                  content: { __typename: "AgentActivityResponseContent", body: "Done" },
+                },
+                {
+                  id: "activity-2",
+                  createdAt: "2023-11-14T22:13:19.002Z",
+                  signal: null,
+                  user: { id: "app-user", name: null },
+                  content: { __typename: "AgentActivityActionContent" },
+                },
+                {
+                  id: "activity-1",
+                  createdAt: "2023-11-14T22:13:19.001Z",
+                  signal: "stop",
+                  user: { id: "user-1", name: "Ada" },
+                  content: { __typename: "AgentActivityPromptContent", body: "Please fix" },
+                },
+                {
+                  id: "activity-0",
+                  createdAt: "2023-11-14T22:13:19.000Z",
+                  signal: null,
+                  user: null,
+                  content: { __typename: "AgentActivityFutureContent", body: "unknown" },
+                },
+              ],
+              pageInfo: { hasPreviousPage: true },
+            },
+          },
+        },
+      }),
+    );
+
+    const history = await api.readAgentSessionActivities({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      beforeCreatedAt: "2023-11-14T22:13:19.004Z",
+    });
+
+    assert.deepEqual(history, {
+      complete: false,
+      activities: [
+        {
+          id: "activity-1",
+          createdAt: "2023-11-14T22:13:19.001Z",
+          signal: "stop",
+          user: { id: "user-1", name: "Ada" },
+          content: { kind: "prompt", body: "Please fix" },
+        },
+        {
+          id: "activity-2",
+          createdAt: "2023-11-14T22:13:19.002Z",
+          signal: null,
+          user: { id: "app-user" },
+          content: { kind: "action" },
+        },
+        {
+          id: "activity-3",
+          createdAt: "2023-11-14T22:13:19.003Z",
+          signal: null,
+          user: { id: "app-user", name: "Paseo" },
+          content: { kind: "response", body: "Done" },
+        },
+      ],
+    });
+    const request = graphqlRequest(requests[0]!.body);
+    assert.match(
+      request.query,
+      /query PaseoAgentSessionActivities\(\$id: String!, \$before: DateTime!\)/u,
+    );
+    assert.match(request.query, /last: 49/u);
+    assert.match(request.query, /orderBy: createdAt/u);
+    assert.match(request.query, /filter: \{ createdAt: \{ lt: \$before \} \}/u);
+    for (const content of ["Prompt", "Response", "Error", "Elicitation"]) {
+      assert.ok(
+        request.query.includes(`... on AgentActivity${content}Content { body }`),
+        `query lacks the ${content} fragment`,
+      );
+    }
+    assert.deepEqual(request.variables, { id: "session-1", before: "2023-11-14T22:13:19.004Z" });
+  });
+
+  it("reads a team's workflow states in display order", async () => {
+    const { api, requests } = apiClient(() =>
+      json({
+        data: {
+          team: {
+            states: {
+              nodes: [
+                { id: "state-done", name: "Done", type: "completed", position: 3 },
+                { id: "state-progress", name: "In Progress", type: "started", position: 1 },
+                { id: "state-review", name: "In Review", type: "started", position: 2 },
+              ],
+            },
+          },
+        },
+      }),
+    );
+
+    const states = await api.readTeamStates({
+      linearOrganizationId: "linear-org",
+      teamId: "team-1",
+    });
+
+    assert.deepEqual(states, [
+      { id: "state-progress", name: "In Progress", type: "started", position: 1 },
+      { id: "state-review", name: "In Review", type: "started", position: 2 },
+      { id: "state-done", name: "Done", type: "completed", position: 3 },
+    ]);
+    const request = graphqlRequest(requests[0]!.body);
+    assert.match(request.query, /query PaseoTeamStates\(\$id: String!\)/u);
+    assert.match(
+      request.query,
+      /team\(id: \$id\) \{ states \{ nodes \{ id name type position \} \} \}/u,
+    );
+    assert.deepEqual(request.variables, { id: "team-1" });
+  });
+
+  it("updates an issue's state and delegate through issueUpdate", async () => {
+    const { api, requests } = apiClient(() => json({ data: { issueUpdate: { success: true } } }));
+
+    await api.updateIssue({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      stateId: "state-progress",
+      delegateId: "app-user",
+    });
+    await api.updateIssue({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      stateId: "state-done",
+    });
+
+    const request = graphqlRequest(requests[0]!.body);
+    assert.match(
+      request.query,
+      /mutation PaseoIssueUpdate\(\$id: String!, \$input: IssueUpdateInput!\)/u,
+    );
+    assert.match(request.query, /issueUpdate\(id: \$id, input: \$input\) \{ success \}/u);
+    assert.deepEqual(request.variables, {
+      id: "issue-1",
+      input: { stateId: "state-progress", delegateId: "app-user" },
+    });
+    assert.deepEqual(graphqlRequest(requests[1]!.body).variables, {
+      id: "issue-1",
+      input: { stateId: "state-done" },
+    });
+  });
+
+  it("links a GitHub pull request to an issue", async () => {
+    const { api, requests } = apiClient(() =>
+      json({ data: { attachmentLinkGitHubPR: { success: true } } }),
+    );
+
+    await api.linkGitHubPullRequest({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      url: "https://github.com/acme/app/pull/7",
+      title: "Fix login",
+    });
+    await api.linkGitHubPullRequest({
+      linearOrganizationId: "linear-org",
+      issueId: "issue-1",
+      url: "https://github.com/acme/app/pull/8",
+    });
+
+    const request = graphqlRequest(requests[0]!.body);
+    assert.match(
+      request.query,
+      /mutation PaseoAttachmentLinkGitHubPR\(\$issueId: String!, \$url: String!, \$title: String\)/u,
+    );
+    assert.match(
+      request.query,
+      /attachmentLinkGitHubPR\(issueId: \$issueId, url: \$url, title: \$title\) \{ success \}/u,
+    );
+    assert.deepEqual(request.variables, {
+      issueId: "issue-1",
+      url: "https://github.com/acme/app/pull/7",
+      title: "Fix login",
+    });
+    assert.deepEqual(graphqlRequest(requests[1]!.body).variables, {
+      issueId: "issue-1",
+      url: "https://github.com/acme/app/pull/8",
+    });
+  });
+
+  it("reports HTTP failures and GraphQL errors as LinearApiError with status and code", async () => {
+    const rateLimited = apiClient(() => new Response("slow down", { status: 429 }));
+    await assert.rejects(
+      rateLimited.api.readTeamStates({ linearOrganizationId: "linear-org", teamId: "team-1" }),
+      (error: unknown) =>
+        error instanceof LinearApiError &&
+        error.status === 429 &&
+        error.code === undefined &&
+        error.message === "Linear GraphQL HTTP 429",
+    );
+
+    const forbidden = apiClient(() =>
+      json({
+        errors: [
+          {
+            message: "Entity not found: AgentSession",
+            extensions: { code: "FORBIDDEN", type: "invalid input" },
+          },
+        ],
+      }),
+    );
+    await assert.rejects(
+      forbidden.api.updateAgentSession({
+        linearOrganizationId: "linear-org",
+        agentSessionId: "session-1",
+        summary: "x",
+      }),
+      (error: unknown) =>
+        error instanceof LinearApiError &&
+        error.status === 200 &&
+        error.code === "FORBIDDEN" &&
+        error.message === "Linear GraphQL Entity not found: AgentSession",
+    );
+  });
+
+  it("refreshes an expired token under the connection lock before emitting an activity", async () => {
+    const updates: unknown[] = [];
+    const requests: Array<{ authorization: string | null; body: string }> = [];
+    const connection: LinearConnectionRecord = {
+      ...linearConnection(),
+      accessToken: "expired-token",
+      accessTokenExpiresAt: new Date(1_700_000_000_000),
+    };
+    let lockedRefreshes = 0;
+    const api = createLinearApiClient({
+      connectionForLinearOrganization: async () => connection,
+      withLinearConnectionRefresh: async (linearOrganizationId, operation) => {
+        lockedRefreshes += 1;
+        assert.equal(linearOrganizationId, "linear-org");
+        return operation(connection, async (update) => {
+          updates.push({ connectionId: connection.id, ...update });
+        });
+      },
+      connectionClient: {
+        refresh: async () => ({ accessToken: "fresh-token", refreshToken: "next-refresh-token" }),
+      },
+      now: () => new Date(1_700_000_010_000),
+      fetch: async (_url, init) => {
+        requests.push({
+          authorization: new Headers(init?.headers).get("authorization"),
+          body: readableBody(init?.body),
+        });
+        return json({
+          data: { agentActivityCreate: { success: true, agentActivity: { id: "activity-1" } } },
+        });
+      },
+    });
+
+    await api.createAgentActivity({
+      linearOrganizationId: "linear-org",
+      agentSessionId: "session-1",
+      content: { type: "thought", body: "On it" },
+      ephemeral: true,
+    });
+
+    assert.equal(lockedRefreshes, 1);
+    assert.deepEqual(updates, [
+      {
+        connectionId: "connection-1",
+        accessToken: "fresh-token",
+        refreshToken: "next-refresh-token",
+      },
+    ]);
+    assert.deepEqual(
+      requests.map((request) => request.authorization),
+      ["Bearer fresh-token"],
+    );
+    assert.match(requests[0]!.body, /agentActivityCreate/u);
+  });
+});
+
+function linearConnection(): LinearConnectionRecord {
+  return {
+    id: "connection-1",
+    organizationId: "hub-org",
+    slug: "acme-linear",
+    providerApplicationId: "linear-app",
+    linearOrganizationId: "linear-org",
+    linearOrganizationName: "Acme",
+    appUserId: "app-user",
+    accessToken: "access-token",
+    refreshToken: "refresh-token",
+    accessTokenExpiresAt: null,
+    scopes: GRANTED_SCOPES,
+  };
+}
+
+/** An API client over a usable token, recording every GraphQL request it sends. */
+function apiClient(respond: () => Response): {
+  api: LinearApiClient;
+  requests: Array<{ authorization: string | null; body: string }>;
+} {
+  const requests: Array<{ authorization: string | null; body: string }> = [];
+  const connection = linearConnection();
+  const api = createLinearApiClient({
+    connectionForLinearOrganization: async () => connection,
+    withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+    connectionClient: { refresh: async () => ({ accessToken: "unused" }) },
+    fetch: async (_url, init) => {
+      requests.push({
+        authorization: new Headers(init?.headers).get("authorization"),
+        body: readableBody(init?.body),
+      });
+      return respond();
+    },
+  });
+  return { api, requests };
+}
 
 function json(value: unknown): Response {
   return new Response(JSON.stringify(value), {

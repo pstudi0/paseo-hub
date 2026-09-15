@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 import { load } from "js-yaml";
 import { z } from "zod";
+import { LINEAR_REQUIRED_SCOPES } from "../providers/linear/client.js";
 import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import {
   PROVIDER_GUIDES,
@@ -11,6 +12,8 @@ import {
   guideUrl,
   identityLabel,
   isSecureOrigin,
+  LINEAR_WEBHOOK_CATEGORIES,
+  linearScopesRequested,
   slackManifest,
   SLACK_WEBHOOK_GUIDE,
   statusPresentation,
@@ -48,6 +51,41 @@ test("the Slack manifest asks for exactly the scopes Hub checks installations ag
     })
     .parse(load(slackManifest(LOCAL, "socket")));
   assert.deepEqual(socket.oauth_config.scopes.bot, [...SLACK_REQUIRED_BOT_SCOPES]);
+});
+
+test("the Linear guide asks for exactly the scopes Hub checks installations against", () => {
+  assert.deepEqual(linearScopesRequested(), [...LINEAR_REQUIRED_SCOPES]);
+  const steps = guideGroups(guideFor("linear"), ORIGIN).flatMap((group) => group.steps);
+  const scopes = steps.find((step) => stepText(step).includes("asks for these scopes"));
+  assert.ok(scopes !== undefined, "the guide has a scopes step");
+  assert.deepEqual(scopes.events, [...LINEAR_REQUIRED_SCOPES]);
+  assert.ok(
+    stepText(scopes).includes("actor=app"),
+    "the guide names the actor the app authorizes as",
+  );
+});
+
+test("the Linear guide lists every webhook category the agent needs, agent sessions last", () => {
+  const steps = guideGroups(guideFor("linear"), ORIGIN).flatMap((group) => group.steps);
+  const webhooks = steps.find((step) => step.urls?.includes("events"));
+  assert.deepEqual(webhooks?.events, [
+    "Issues",
+    "Comments",
+    "Agent session events",
+    "Inbox notifications",
+    "Permission changes",
+  ]);
+  assert.deepEqual(webhooks?.events, LINEAR_WEBHOOK_CATEGORIES);
+  const texts = steps.map(stepText);
+  const categories = texts.findIndex((text) => text.includes("select these categories"));
+  const enableLast = texts.findIndex((text) => text.startsWith("Enable Agent session events last"));
+  assert.ok(categories >= 0 && enableLast > categories, "agent sessions are switched on last");
+  const identity = texts.findIndex((text) => text.includes("how the agent appears in Linear"));
+  assert.ok(identity >= 0 && identity < categories, "the agent identity comes before webhooks");
+  assert.equal(
+    guideFor("linear").summary,
+    "Runs as a Linear agent: takes delegated issues and mentions, streams progress into the issue's agent session, and posts outcomes back to Linear.",
+  );
 });
 
 test("generated URLs are built from the resolved callback origin", () => {

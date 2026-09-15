@@ -23,7 +23,8 @@ const APP_SUMMARIES: Readonly<Record<AppProvider, string>> = {
   GitHub: "Reads issues and pull requests, and lets agents push.",
   Slack: "Reads mentions in your workspace and replies in the thread.",
   Discord: "Reads mentions in your server and replies in the thread.",
-  Linear: "Starts project-scoped workflows from issues and posts outcomes back to Linear.",
+  Linear:
+    "Runs as a Linear agent: takes delegated issues and mentions, streams progress into the issue's agent session, and posts outcomes back to Linear.",
 };
 
 /**
