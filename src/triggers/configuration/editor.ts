@@ -65,11 +65,35 @@ export function projectTriggerForm(yaml: string): TriggerFormProjection {
   if ("choices" in trigger.run.agent) {
     return { status: "yaml_only", reason: "Agent choices can only be edited in YAML." };
   }
+  if (admitsOnlyAutomations(event, definition)) {
+    return {
+      status: "yaml_only",
+      reason:
+        "A delegation trigger that admits automations without naming users can only be edited in YAML.",
+    };
+  }
   const agent = trigger.run.agent;
   return {
     status: "editable",
     value: toFormValue(trigger, event, definition, agent),
   };
+}
+
+/**
+ * The form models the audience as named users or everyone. A `linear.agent_session_created`
+ * trigger that names nobody and admits automations (a triage rule delegating without any human
+ * allowed) is valid for the compiler but has no form representation: projecting it would read as
+ * "everyone", which the field refuses for that event.
+ */
+function admitsOnlyAutomations(
+  event: EditorEvent,
+  definition: TriggerDocument["on"][string],
+): boolean {
+  return (
+    event === "linear.agent_session_created" &&
+    definition.filters?.allow_automations === true &&
+    (definition.filters.from_users?.length ?? 0) === 0
+  );
 }
 
 function toFormValue(

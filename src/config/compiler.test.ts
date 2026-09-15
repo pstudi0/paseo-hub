@@ -923,18 +923,34 @@ describe("Linear agent session configuration", () => {
         }),
       /trigger delegated requires filters\.team for linear\.agent_session_created/u,
     );
-    for (const from_users of [["*"], [], ["user-anthony", "*"]]) {
+    for (const from_users of [["*"], ["user-anthony", "*"]]) {
+      for (const allow_automations of [undefined, true]) {
+        assert.throws(
+          () =>
+            compileHubConfig({
+              ...configuration(),
+              triggers: [
+                sessionTrigger("linear.agent_session_created", {
+                  filters: {
+                    team: TEAM,
+                    from_users,
+                    ...(allow_automations === undefined ? {} : { allow_automations }),
+                  },
+                }),
+              ],
+            }),
+          /requires explicit Linear user IDs in filters\.from_users for linear\.agent_session_created; "\*" is not allowed/u,
+        );
+      }
+    }
+    for (const filters of [{ team: TEAM }, { team: TEAM, allow_automations: false }]) {
       assert.throws(
         () =>
           compileHubConfig({
             ...configuration(),
-            triggers: [
-              sessionTrigger("linear.agent_session_created", {
-                filters: { team: TEAM, ...(from_users.length === 0 ? {} : { from_users }) },
-              }),
-            ],
+            triggers: [sessionTrigger("linear.agent_session_created", { filters })],
           }),
-        /requires explicit Linear user IDs in filters\.from_users for linear\.agent_session_created; "\*" is not allowed/u,
+        /trigger delegated requires explicit Linear user IDs in filters\.from_users or filters\.allow_automations: true for linear\.agent_session_created; a delegation runs code on your daemon/u,
       );
     }
     assert.throws(
@@ -951,6 +967,19 @@ describe("Linear agent session configuration", () => {
         triggers: [sessionTrigger("linear.agent_session_prompted")],
       }),
     );
+  });
+
+  it("accepts a triage delegation that admits automations without naming any human", () => {
+    const compiled = compileHubConfig({
+      ...configuration(),
+      triggers: [
+        sessionTrigger("linear.agent_session_created", {
+          filters: { team: TEAM, allow_automations: true },
+        }),
+      ],
+    });
+    assert.deepEqual(compiled.triggers[0]?.filters, { team: TEAM, allow_automations: true });
+    assert.deepEqual(parseCompiledHubConfig(structuredClone(compiled)), compiled);
   });
 
   it.each(["project", "states", "assignees", "labels", "exclude_labels", "pattern", "contains"])(
