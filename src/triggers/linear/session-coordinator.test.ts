@@ -716,6 +716,7 @@ class RecordingClient {
   asApiClient(): LinearApiClient {
     const unsupported = () => Promise.reject(new Error("not recorded by this test"));
     const client: LinearApiClient = {
+      accessTokenFor: () => Promise.resolve("linear-access-token"),
       readIssue: () => Promise.resolve(this.issue),
       readIssueComments: unsupported,
       createComment: (input) => {

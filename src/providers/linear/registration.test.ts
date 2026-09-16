@@ -254,6 +254,7 @@ function linearConfiguration() {
 function unusedLinearApiClient(overrides: Partial<LinearApiClient>): LinearApiClient {
   const unused = (method: string) => () => Promise.reject(new Error(`${method} is unused`));
   return {
+    accessTokenFor: unused("accessTokenFor"),
     readIssue: unused("readIssue"),
     readIssueComments: unused("readIssueComments"),
     createComment: unused("createComment"),

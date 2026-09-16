@@ -459,6 +459,12 @@ export interface LinearIssueCommentHistory {
 }
 
 export interface LinearApiClient {
+  /**
+   * The app's live access token for one workspace, refreshed when it is about to expire. The Hub
+   * hands this to an agent's execution environment so the agent can call Linear's API itself, with
+   * the agent app's identity rather than a person's.
+   */
+  accessTokenFor(linearOrganizationId: string): Promise<string>;
   readIssue(input: {
     linearOrganizationId: string;
     issueId: string;
@@ -756,6 +762,7 @@ export function createLinearApiClient(options: {
   };
 
   return {
+    accessTokenFor,
     async readIssue(input) {
       const result = IssueResponseSchema.parse(
         await graphql(

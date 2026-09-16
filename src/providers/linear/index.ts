@@ -174,6 +174,7 @@ export function createLinearRegistration(
       callbackOrigin: options.publicBaseUrl,
     },
     connection,
+    ...(api === undefined ? {} : { integration: linearIntegration(database, api) }),
     triggerProviders: [
       ({ configurationStoreForProject }) =>
         createLinearTriggerProvider({
@@ -517,4 +518,34 @@ function linearStatus(configured: boolean, bindings: readonly LinearConnectionRe
   return bindings.some((binding) => linearConnectionRequiresReauthorization(binding))
     ? { status: "requiresReauthorization" as const }
     : { status: "connected" as const };
+}
+
+/**
+ * Hands an agent the app's own Linear token for the run, through the same
+ * `${{ paseo.connections.<slug>.token }}` mechanism GitHub uses. An agent that holds it talks to
+ * Linear's API directly, signed as the agent app, instead of routing every write back through the
+ * Hub. The token is the workspace installation's: it can do exactly what the app can, in the teams
+ * the workspace granted it, and nothing more.
+ */
+function linearIntegration(database: Database, api: LinearApiClient) {
+  return {
+    async resolve(projectId: string, connectionSlug: string, value: string): Promise<string> {
+      if (value !== "token") {
+        throw new Error(`unsupported linear integration value: ${value}`);
+      }
+      const project = await database.findProjectById(projectId);
+      const selected =
+        project === undefined
+          ? undefined
+          : (await database.organizationConnectionUsage(project.organizationId)).linear.find(
+              (candidate) =>
+                candidate.organizationId === project.organizationId &&
+                candidate.slug === connectionSlug,
+            );
+      if (selected === undefined) {
+        throw new Error(`linear connection is unavailable: ${connectionSlug}`);
+      }
+      return api.accessTokenFor(selected.linearOrganizationId);
+    },
+  };
 }
