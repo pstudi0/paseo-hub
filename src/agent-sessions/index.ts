@@ -244,7 +244,27 @@ export class AgentSessions {
       throw new Error("Session agent is missing");
     const agent = await connection.get(session.agentId);
     if (!agent.archivedAt && (agent.status === "closed" || agent.status === "error")) {
-      throw new AgentSessionError("agent_interrupted");
+      // A workspace-keyed session outlives its agent: a Linear follow-up hours later finds the
+      // daemon agent closed while the workspace is still live, so it gets a new agent in that
+      // workspace. Without a workspace key there is nothing to continue from, and the execution
+      // is reported as interrupted instead.
+      if (session.workspaceKey === null) throw new AgentSessionError("agent_interrupted");
+      const options = { ...session.creationOptions, workspaceId: session.workspaceId };
+      delete options.worktree;
+      const replacement = await connection.create(
+        `${session.id}:after:${session.agentId}`,
+        options,
+        startupTimeoutMs,
+      );
+      session = { ...session, agentId: replacement.id, workspaceId: replacement.workspaceId };
+      await this.database.saveAgentSession(session);
+      return {
+        session,
+        agentId: replacement.id,
+        workspaceId: replacement.workspaceId,
+        action: "created",
+        workspace: { action: "reused" },
+      };
     }
     if (agent.archivedAt) {
       // An agent archived on its own (`archive_agent`) leaves the workspace live: nothing to

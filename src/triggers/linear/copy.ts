@@ -3,10 +3,10 @@
  * session timeline, so they address the person who delegated the issue, never the operator.
  */
 export const LINEAR_COPY = {
-  ack: "Received. Preparing a Paseo workspace for this issue…",
-  queued: "Queued on the project's Paseo daemon.",
-  started: "Agent started in the workspace.",
-  followUpReceived: "Follow-up received. Starting a new run in the same workspace…",
+  ack: "Thinking…",
+  queued: "Queued…",
+  started: "Working…",
+  followUpReceived: "Thinking…",
   followUpDelivered: "Follow-up delivered to the running agent.",
   followUpQueued: "Follow-up queued; it will be delivered as soon as the agent is ready.",
   followUpUndeliverable:

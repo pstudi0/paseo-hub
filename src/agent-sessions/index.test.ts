@@ -489,6 +489,22 @@ test("a completed credentialed issue session gets a fresh agent in the same work
   expect(f.connection.creates[1]).toMatchObject({ workspaceId: original.workspaceId });
 });
 
+test("a follow-up whose daemon agent died starts a new agent in the same workspace", async () => {
+  const f = await fixture();
+  const first = await f.issueArrival("linear:session:1");
+  const original = await first.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  // The daemon closed the agent long after the run; the workspace is still live.
+  const dead = f.connection.agents.get(original.agentId);
+  f.connection.agents.set(original.agentId, { ...dead!, status: "closed" });
+
+  const followUp = await f.issueArrival("linear:session:1");
+  const fresh = await followUp.dispatch();
+  expect(fresh.agentId).not.toBe(original.agentId);
+  expect(fresh.workspaceId).toBe(original.workspaceId);
+  expect(fresh).toMatchObject({ action: "created", workspace: { action: "reused" } });
+});
+
 test("the workspace choice is persisted before creation so a replayed dispatch repeats the same request", async () => {
   const f = await fixture();
   const first = await f.issueArrival("linear:session:1");
