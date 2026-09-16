@@ -69,6 +69,15 @@ export const LINEAR_GRAPHQL_DOCUMENTS = {
   agentSessionUpdate: `mutation PaseoAgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
     agentSessionUpdate(id: $id, input: $input) { success }
   }`,
+  commentThreadRoot: `query PaseoCommentThreadRoot($id: String!) {
+    comment(id: $id) { id parent { id } }
+  }`,
+  agentSessionCreateOnComment: `mutation PaseoAgentSessionCreateOnComment($commentId: String!) {
+    agentSessionCreateOnComment(input: { commentId: $commentId }) {
+      success
+      agentSession { id }
+    }
+  }`,
   agentSessionActivities: `query PaseoAgentSessionActivities($id: String!, $filter: AgentActivityFilter) {
     agentSession(id: $id) {
       activities(last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}, orderBy: createdAt, filter: $filter) {
@@ -210,6 +219,21 @@ const AgentActivityCreateResponseSchema = z.object({
 
 const AgentSessionUpdateResponseSchema = z.object({
   data: z.object({ agentSessionUpdate: z.object({ success: z.boolean() }) }),
+});
+
+const CommentThreadRootResponseSchema = z.object({
+  data: z.object({
+    comment: z.object({ id: z.string(), parent: z.object({ id: z.string() }).nullable() }),
+  }),
+});
+
+const AgentSessionCreateResponseSchema = z.object({
+  data: z.object({
+    agentSessionCreateOnComment: z.object({
+      success: z.boolean(),
+      agentSession: z.object({ id: z.string() }),
+    }),
+  }),
 });
 
 export type LinearAgentSessionActivityType = (typeof LINEAR_CONVERSATION_ACTIVITY_TYPES)[number];
@@ -453,6 +477,22 @@ export interface LinearApiClient {
     beforeCreatedAt: string;
     excludeActivityId: string | null;
   }): Promise<LinearAgentSessionActivityHistory>;
+  /**
+   * The root comment of the thread `commentId` belongs to: the comment itself when it starts a
+   * thread, its parent otherwise. Agent sessions are always anchored to a thread root.
+   */
+  readCommentThreadRoot(input: {
+    linearOrganizationId: string;
+    commentId: string;
+  }): Promise<string | undefined>;
+  /**
+   * Opens an agent session on a comment thread so the agent's activities and its answer render
+   * under that comment, instead of in the thread of a session Linear reused for the issue.
+   */
+  createAgentSessionOnComment(input: {
+    linearOrganizationId: string;
+    commentId: string;
+  }): Promise<{ id: string }>;
   /** A team's workflow states in display order; callers pick by `type` (for example `started`). */
   readTeamStates(input: {
     linearOrganizationId: string;
@@ -831,6 +871,37 @@ export function createLinearApiClient(options: {
         .filter((activity) => activity !== undefined)
         .sort(compareLinearCommentOrder);
       return { activities, complete: !session.activities.pageInfo.hasPreviousPage };
+    },
+    async readCommentThreadRoot(input) {
+      const result = CommentThreadRootResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.commentThreadRoot,
+            variables: { id: input.commentId },
+          },
+          transport,
+        ),
+      );
+      return result.data.comment.parent?.id ?? result.data.comment.id;
+    },
+    async createAgentSessionOnComment(input) {
+      const result = AgentSessionCreateResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.agentSessionCreateOnComment,
+            variables: { commentId: input.commentId },
+          },
+          transport,
+        ),
+      );
+      if (!result.data.agentSessionCreateOnComment.success) {
+        throw new Error("Linear refused to open an agent session on the comment");
+      }
+      return { id: result.data.agentSessionCreateOnComment.agentSession.id };
     },
     async readTeamStates(input) {
       const result = TeamStatesResponseSchema.parse(

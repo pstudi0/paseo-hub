@@ -68,6 +68,7 @@ export type LinearFollowUpOutcome =
   | "queued"
   | "answered_permission"
   | "stopped"
+  | "forked"
   | "dispatch";
 
 /**
@@ -132,6 +133,7 @@ export class LinearSessionCoordinator {
       await this.stop(record, activity.user.name);
       return "stopped";
     }
+    if (await this.forkOntoComment(event, activity)) return "forked";
     if (record.pendingPermission !== null) {
       void this.answerPermission(record, record.pendingPermission, activity.body).catch(
         (error: unknown) => this.report(error, "linear.permission.answer", record),
@@ -155,6 +157,43 @@ export class LinearSessionCoordinator {
     }
     void this.emit(target, ephemeralThought(LINEAR_COPY.followUpReceived));
     return "dispatch";
+  }
+
+  /**
+   * Linear funnels every later mention on an issue into the session it already has, so an answer
+   * written as a session activity lands in that session's thread and the person who commented
+   * never sees it. When the prompt comes from another thread, open a session on that thread
+   * instead: Linear then renders the agent's activities and its answer under the comment, and
+   * sends a `created` event that starts the run. Returns false when the prompt is already in the
+   * session's own thread, which needs no forking.
+   */
+  private async forkOntoComment(
+    event: NormalizedLinearAgentSessionEvent,
+    activity: NonNullable<NormalizedLinearAgentSessionEvent["activity"]>,
+  ): Promise<boolean> {
+    const client = this.options.state.client;
+    const sourceCommentId = activity.sourceCommentId;
+    if (client === undefined || sourceCommentId === null) return false;
+    try {
+      const root = await client.readCommentThreadRoot({
+        linearOrganizationId: event.organizationId,
+        commentId: sourceCommentId,
+      });
+      if (root === undefined || root === event.session.commentId) return false;
+      const forked = await client.createAgentSessionOnComment({
+        linearOrganizationId: event.organizationId,
+        commentId: root,
+      });
+      logger.info(
+        { sessionId: event.session.id, forkedSessionId: forked.id, commentId: root },
+        "opened a Linear agent session on the commented thread",
+      );
+      return true;
+    } catch (error) {
+      // The answer still reaches the session's own thread; losing the fork is not losing the reply.
+      this.report(error, "linear.session.fork");
+      return false;
+    }
   }
 
   /** A `stop` signal: no run, no archive, a final response by the failing execution's hook. */

@@ -98,6 +98,33 @@ describe("Linear session coordinator", () => {
     assert.equal(await world.coordinator.followUp(promptedEvent(), sessionInput()), "dispatch");
   });
 
+  it("opens a session on the commented thread when the prompt comes from another thread", async () => {
+    const world = createWorld();
+    await world.coordinator.acknowledge(createdEvent(), sessionInput());
+    world.executions.set("exec-1", execution("exec-1", "running", "agent-1"));
+    await world.database.updateLinearAgentSession(LINEAR_FIXTURE.sessionId, {
+      currentExecutionId: "exec-1",
+      daemonAgentId: "agent-1",
+    });
+    world.client.threadRoot = LINEAR_FIXTURE.mentionCommentId;
+
+    const prompted = promptedEvent("Add tests", LINEAR_FIXTURE.previousCommentId);
+    assert.equal(await world.coordinator.followUp(prompted, sessionInput()), "forked");
+    assert.deepEqual(
+      world.client.calls.filter((call) => call.method === "createAgentSessionOnComment"),
+      [
+        {
+          method: "createAgentSessionOnComment",
+          input: {
+            linearOrganizationId: LINEAR_FIXTURE.organizationId,
+            commentId: LINEAR_FIXTURE.mentionCommentId,
+          },
+        },
+      ],
+    );
+    assert.equal(world.control.steers.length, 0);
+  });
+
   it("queues a follow-up while the agent is still spawning", async () => {
     const world = createWorld();
     await world.coordinator.acknowledge(createdEvent(), sessionInput());
@@ -367,11 +394,15 @@ function createdEvent(): NormalizedLinearAgentSessionEvent {
   return sessionEvent(readLinearFixture("linear-agent-session-created"));
 }
 
-function promptedEvent(body = "Add tests"): NormalizedLinearAgentSessionEvent {
+function promptedEvent(
+  body = "Add tests",
+  sourceCommentId?: string,
+): NormalizedLinearAgentSessionEvent {
   const fixture = readLinearFixture("linear-agent-session-prompted");
   const activity = fixtureRecord(fixture["agentActivity"]);
   activity["body"] = body;
   fixtureRecord(activity["content"])["body"] = body;
+  if (sourceCommentId !== undefined) activity["sourceCommentId"] = sourceCommentId;
   return sessionEvent(fixture);
 }
 
@@ -482,6 +513,8 @@ function execution(
 
 class RecordingClient {
   calls: { method: string; input: Record<string, unknown> }[] = [];
+  /** The thread root `readCommentThreadRoot` reports; tests override it to fork a session. */
+  threadRoot: string | undefined = undefined;
   private inFlight: Promise<unknown>[] = [];
 
   /** The methods the coordinator calls; anything else throws when reached. */
@@ -494,6 +527,11 @@ class RecordingClient {
       createAgentActivity: (input) => this.createAgentActivity(input),
       updateAgentSession: (input) => this.updateAgentSession(input),
       readAgentSessionActivities: unsupported,
+      readCommentThreadRoot: () => Promise.resolve(this.threadRoot),
+      createAgentSessionOnComment: (input) => {
+        this.calls.push({ method: "createAgentSessionOnComment", input: asRecord(input) });
+        return Promise.resolve({ id: "session-on-comment" });
+      },
       readTeamStates: () => this.readTeamStates(),
       updateIssue: (input) => this.updateIssue(input),
       linkGitHubPullRequest: (input) => this.linkGitHubPullRequest(input),

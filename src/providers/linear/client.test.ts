@@ -983,10 +983,12 @@ describe("Linear API client contracts", () => {
     assert.deepEqual(Object.keys(LINEAR_GRAPHQL_DOCUMENTS).sort(), [
       "agentActivityCreate",
       "agentSessionActivities",
+      "agentSessionCreateOnComment",
       "agentSessionUpdate",
       "attachmentLinkGitHubPR",
       "attachmentLinkURL",
       "commentCreate",
+      "commentThreadRoot",
       "issue",
       "issueCommentHistory",
       "issueUpdate",
