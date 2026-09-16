@@ -455,45 +455,94 @@ function isHubTool(name: string): boolean {
   return name.startsWith("hub.") || name.startsWith("mcp__hub__");
 }
 
+/** Paseo's own `detail.type`, the reliable signal when the daemon sends one. */
 const TOOL_VERBS: Readonly<Record<string, { verb: string; keys: readonly string[] }>> = {
   shell: { verb: "Running", keys: ["command"] },
   read: { verb: "Reading", keys: ["filePath"] },
   edit: { verb: "Editing", keys: ["filePath"] },
   write: { verb: "Editing", keys: ["filePath"] },
   search: { verb: "Searching", keys: ["query"] },
-  fetch: { verb: "Fetching", keys: ["url"] },
+  fetch: { verb: "Reading", keys: ["url"] },
   sub_agent: { verb: "Delegating", keys: ["description", "subAgentType"] },
   plain_text: { verb: "", keys: ["text", "label"] },
   plan: { verb: "Planning", keys: ["text"] },
   worktree_setup: { verb: "Preparing", keys: ["branchName"] },
 };
 
-/** Verb and parameter derived from `detail.type`; tool names vary per Paseo provider. */
+/**
+ * Plain words for the tools coding agents actually call, so the timeline reads to someone who
+ * does not write code. Tool names vary between providers, so this is matched case-insensitively
+ * and only used when the daemon sent no usable `detail`.
+ */
+const TOOL_NAMES: Readonly<Record<string, { verb: string; parameter: string }>> = {
+  bash: { verb: "Running", parameter: "a command" },
+  shell: { verb: "Running", parameter: "a command" },
+  read: { verb: "Reading", parameter: "a file" },
+  write: { verb: "Writing", parameter: "a file" },
+  edit: { verb: "Editing", parameter: "a file" },
+  multiedit: { verb: "Editing", parameter: "a file" },
+  notebookedit: { verb: "Editing", parameter: "a notebook" },
+  glob: { verb: "Searching", parameter: "the files" },
+  grep: { verb: "Searching", parameter: "the code" },
+  websearch: { verb: "Searching", parameter: "the web" },
+  webfetch: { verb: "Reading", parameter: "a web page" },
+  todowrite: { verb: "Updating", parameter: "its plan" },
+  task: { verb: "Delegating", parameter: "a sub-task" },
+  agent: { verb: "Delegating", parameter: "a sub-task" },
+  toolsearch: { verb: "Loading", parameter: "its tools" },
+  task_notification: { verb: "Running", parameter: "a command" },
+};
+
+/** A shell command reads better as its program and first argument than as a full command line. */
+function summarizeCommand(command: string): string {
+  const words = command.trim().split(/\s+/u);
+  const program = words[0] ?? "";
+  const subcommand =
+    words[1] !== undefined && /^[a-z][\w-]*$/u.test(words[1]) ? ` ${words[1]}` : "";
+  return `${program}${subcommand}`;
+}
+
+/**
+ * Verb and parameter for one tool call. Linear shows them side by side, so neither may be empty
+ * and repeating the tool name twice reads as noise.
+ */
 export function describeToolCall(item: {
   name: string;
   detail?: Record<string, unknown> | undefined;
 }): { verb: string; parameter: string } {
-  const detail = item.detail ?? {};
-  const type = typeof detail["type"] === "string" ? detail["type"] : "unknown";
+  const detailed = describeFromDetail(item.detail ?? {});
+  if (detailed !== undefined) return detailed;
+  // No usable detail: fall back to what the tool is commonly called.
   const shortName = item.name.split(/__|\./u).pop() ?? item.name;
+  return TOOL_NAMES[shortName.toLowerCase()] ?? { verb: "Running", parameter: shortName };
+}
+
+/** The reliable path: Paseo told us what kind of tool call this is and what it acted on. */
+function describeFromDetail(
+  detail: Record<string, unknown>,
+): { verb: string; parameter: string } | undefined {
+  const type = typeof detail["type"] === "string" ? detail["type"] : "unknown";
   const mapping = TOOL_VERBS[type];
+  if (mapping === undefined || mapping.verb === "") return undefined;
   const text = (key: string): string | undefined => {
     const value = detail[key];
     return typeof value === "string" && value.trim().length > 0 ? value : undefined;
   };
   let parameter: string | undefined;
-  for (const key of mapping?.keys ?? []) {
+  for (const key of mapping.keys) {
     parameter = text(key);
     if (parameter !== undefined) break;
   }
-  if (type === "search" && parameter !== undefined && text("toolName") !== undefined) {
-    parameter = `${text("toolName") ?? ""}: ${parameter}`;
-  }
-  const firstLine = (parameter ?? item.name).split(/\r?\n/u, 1)[0] ?? item.name;
-  return {
-    verb: mapping === undefined || mapping.verb === "" ? shortName : mapping.verb,
-    parameter: truncate(firstLine.trim() || item.name, PARAMETER_MAX_CHARS),
-  };
+  if (parameter === undefined) return undefined;
+  if (type === "shell") parameter = summarizeCommand(parameter);
+  const searchTool = type === "search" ? text("toolName") : undefined;
+  if (searchTool !== undefined) parameter = `${searchTool}: ${parameter}`;
+  return { verb: mapping.verb, parameter: truncate(firstLine(parameter), PARAMETER_MAX_CHARS) };
+}
+
+function firstLine(value: string): string {
+  const line = value.split(/\r?\n/u, 1)[0] ?? value;
+  return line.trim().length > 0 ? line.trim() : value;
 }
 
 function toolResult(item: { status: string; error?: unknown }): string {

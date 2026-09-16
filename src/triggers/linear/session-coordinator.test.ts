@@ -21,7 +21,7 @@ import { createLinearAgentOutputExecutors } from "./agent-outputs.js";
 import { LINEAR_COPY } from "./copy.js";
 import { normalizeLinearEvent, type NormalizedLinearAgentSessionEvent } from "./events.js";
 import { HubExecutionAgentStreamEventSchema } from "../../hub/protocol.js";
-import { createLinearMirror } from "./mirror.js";
+import { createLinearMirror, describeToolCall } from "./mirror.js";
 import type { LinearOutputContext, LinearTriggerContext } from "./provider.js";
 import {
   LinearSessionCoordinator,
@@ -342,6 +342,22 @@ describe("Linear mirror", () => {
       action: "Running",
       parameter: "npm test",
     });
+    // A tool call the daemon did not describe still reads as plain words, never "Bash Bash".
+    assert.deepEqual(describeToolCall({ name: "Bash" }), {
+      verb: "Running",
+      parameter: "a command",
+    });
+    assert.deepEqual(describeToolCall({ name: "mcp__x__WebFetch" }), {
+      verb: "Reading",
+      parameter: "a web page",
+    });
+    assert.deepEqual(
+      describeToolCall({
+        name: "Bash",
+        detail: { type: "shell", command: "git log --oneline -25 && ls docs" },
+      }),
+      { verb: "Running", parameter: "git log" },
+    );
     assert.deepEqual(activities.at(-2), { type: "thought", body: "Tests pass; wrapping up." });
     assert.deepEqual(activities.at(-1), { type: "response", body: "Tests pass; wrapping up." });
   });
