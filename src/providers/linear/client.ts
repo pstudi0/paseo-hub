@@ -384,6 +384,12 @@ export interface LinearConnectionClient {
   authorizationUrl(state: string): string;
   exchangeCode(code: string): Promise<LinearInstallation>;
   refresh(refreshToken: string): Promise<LinearTokenRefresh>;
+  /**
+   * An `app` actor token minted for one agent run with the `client_credentials` grant, which Linear
+   * recommends over reusing a stored token: "Request a new client credentials token at the start of
+   * each run, then use it only for that run." It is revoked when the run ends.
+   */
+  mintRunToken(): Promise<{ accessToken: string; expiresAt: number }>;
   /** Revokes the access token and, when one is held, the refresh token as well. */
   revoke(accessToken: string, refreshToken?: string | null): Promise<void>;
 }
@@ -668,6 +674,21 @@ export function createLinearConnectionClient(options: {
         ...(token.refreshToken === undefined ? {} : { refreshToken: token.refreshToken }),
         accessTokenExpiresAt: token.accessTokenExpiresAt ?? null,
         ...(token.scopes === undefined ? {} : { scopes: token.scopes }),
+      };
+    },
+    async mintRunToken() {
+      const token = await exchangeToken(
+        request,
+        options,
+        { grant_type: "client_credentials", scope: LINEAR_REQUIRED_SCOPES.join(","), actor: "app" },
+        now,
+      );
+      return {
+        accessToken: token.accessToken,
+        // Linear states 30 days for this grant; trust the response when it says otherwise.
+        expiresAt: (
+          token.accessTokenExpiresAt ?? new Date(now().getTime() + 30 * 86_400_000)
+        ).getTime(),
       };
     },
     async revoke(accessToken, refreshToken) {

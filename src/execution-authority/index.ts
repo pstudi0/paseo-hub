@@ -69,6 +69,8 @@ export interface CreateExecutionAuthorityOptions {
   >;
   connectionsForProject: (projectId: string) => ConnectionResolver;
   githubAuthority?: GitHubAuthorityRegistration | undefined;
+  /** Revokes a Linear run token when its execution ends; leases outlive the minting integration. */
+  linearAuthority?: { revoke(token: string): Promise<void> } | undefined;
   clock?: ExecutionAuthorityClock | undefined;
   isExecutionActive: (executionId: string) => Promise<boolean>;
   logger?: Pick<Logger, "warn" | "error">;
@@ -356,6 +358,11 @@ export function createExecutionAuthority(
     try {
       await Promise.race([
         Promise.resolve().then(() => {
+          if (lease.provider === "linear") {
+            if (!options.linearAuthority)
+              throw new Error("Linear credential revocation is unavailable");
+            return options.linearAuthority.revoke(lease.token);
+          }
           if (!options.githubAuthority)
             throw new Error("GitHub credential revocation is unavailable");
           return options.githubAuthority.revoke(lease.token);

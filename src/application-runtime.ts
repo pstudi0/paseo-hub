@@ -437,10 +437,14 @@ function createRuntimeExecutionAuthority(
   const githubAuthority = [...integrations.values()].find(
     (integration) => integration.githubAuthority !== undefined,
   )?.githubAuthority;
+  const linearAuthority = [...integrations.values()].find(
+    (integration) => integration.linearAuthority !== undefined,
+  )?.linearAuthority;
   return createExecutionAuthority({
     database,
     connectionsForProject,
     ...(githubAuthority === undefined ? {} : { githubAuthority }),
+    ...(linearAuthority === undefined ? {} : { linearAuthority }),
     isExecutionActive: async (executionId) => {
       const execution = await database.findAgentExecutionById(executionId);
       return execution?.status === "spawning" || execution?.status === "running";

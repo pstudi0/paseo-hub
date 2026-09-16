@@ -345,6 +345,10 @@ class BrowserLinearConnections implements LinearConnectionClient {
     return Promise.reject(new Error("unused"));
   }
 
+  mintRunToken(): Promise<{ accessToken: string; expiresAt: number }> {
+    return Promise.resolve({ accessToken: "linear-run-token", expiresAt: 0 });
+  }
+
   revoke(): Promise<void> {
     return Promise.resolve();
   }

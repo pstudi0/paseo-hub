@@ -32,6 +32,8 @@ export interface ProviderIntegrationRegistration {
     context?: ConnectionResolutionContext,
   ): Promise<string>;
   githubAuthority?: GitHubAuthorityRegistration;
+  /** Revokes a Linear run token; the Hub calls it when the execution that holds it ends. */
+  linearAuthority?: { revoke(token: string): Promise<void> };
 }
 
 export interface GitHubAuthorityRegistration {
