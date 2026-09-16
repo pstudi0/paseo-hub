@@ -293,6 +293,8 @@ function createLinearSessions(input: {
       ["linear.ask", executors.ask],
       ["linear.plan", executors.plan],
       ["linear.link", executors.link],
+      ["linear.comment", executors.comment],
+      ["linear.status", executors.status],
     ] as const
   ).map(([type, execute]) => ({
     type,

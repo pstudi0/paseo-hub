@@ -24,7 +24,7 @@ import {
   type LinearOutboundActivity,
 } from "./activity-queue.js";
 import { LINEAR_COPY } from "./copy.js";
-import { linearSessionSource, type NormalizedLinearAgentSessionEvent } from "./events.js";
+import type { NormalizedLinearAgentSessionEvent } from "./events.js";
 import type { LinearLifecycleEvent } from "./lifecycle-events.js";
 import type { LinearSessionState } from "./session-state.js";
 
@@ -114,12 +114,6 @@ export class LinearSessionCoordinator {
           { label: "Paseo Hub", url: `${this.options.publicBaseUrl}/o/${slug}/activity` },
         ],
       });
-    }
-    // Work someone delegated ends with a plain comment on the issue: the session card is a
-    // developer's view, and the team reads the comment stream.
-    const issueId = event.session.issue?.id;
-    if (issueId !== undefined && linearSessionSource(event) !== "mention") {
-      this.options.state.conclusions.set(event.session.id, issueId);
     }
     // A mention written inside a human thread makes Linear open the session on that reply, so the
     // thread itself would only ever show a session card. Answer where the person is looking.
@@ -315,14 +309,36 @@ export class LinearSessionCoordinator {
         this.report(error, "linear.thread_reply.answer");
       }
     }
-    const issueId = this.options.state.conclusions.get(sessionId);
-    if (issueId === undefined) return;
-    this.options.state.conclusions.delete(sessionId);
+    // Read from the record, not from memory: a Hub restart or a follow-up hours later must not be
+    // the reason an issue ends up looking untouched.
+    const record = await this.options.database.findLinearAgentSession(sessionId);
+    if (record === undefined) return;
     try {
-      await client.createComment({ linearOrganizationId, issueId, body });
+      await client.createComment({ linearOrganizationId, issueId: record.issueId, body });
     } catch (error) {
       this.report(error, "linear.conclusion.post");
     }
+  }
+
+  /**
+   * Writes an ordinary comment on the issue, as the agent app. The agent has no Linear credential
+   * of its own — the app token lives here — so every comment it wants to leave passes through
+   * this, which also keeps the agent's Linear identity correct.
+   */
+  async postComment(input: {
+    linearOrganizationId: string;
+    issueId: string;
+    body: string;
+    parentId?: string;
+  }): Promise<void> {
+    const client = this.options.state.client;
+    if (client === undefined) throw new Error("Linear is not connected; the comment was not sent.");
+    await client.createComment({
+      linearOrganizationId: input.linearOrganizationId,
+      issueId: input.issueId,
+      body: input.body,
+      ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+    });
   }
 
   /** Linear reports a lock conflict on a comment it is still writing to as DEADLOCK_DETECTED. */

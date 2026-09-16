@@ -11,7 +11,13 @@ import { isGitHubPullRequestUrl, type LinearSessionCoordinator } from "./session
 /** The output capabilities an agent session exposes as `hub` MCP tools, in registration order. */
 export const LINEAR_OUTPUT_TOOLS: Readonly<
   Record<
-    "linear.reply" | "linear.response" | "linear.ask" | "linear.plan" | "linear.link",
+    | "linear.reply"
+    | "linear.response"
+    | "linear.ask"
+    | "linear.plan"
+    | "linear.link"
+    | "linear.comment"
+    | "linear.status",
     OutputToolDefinition
   >
 > = {
@@ -90,6 +96,31 @@ export const LINEAR_OUTPUT_TOOLS: Readonly<
       additionalProperties: false,
     },
   },
+  "linear.comment": {
+    name: "linear_comment",
+    description:
+      "Writes a comment on the Linear issue, visible to everyone who opens it. Use it to keep the team informed while you work, or to reply inside a comment thread by passing the comment you are answering.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        body: { type: "string", minLength: 1 },
+        replyToCommentId: { type: "string", minLength: 1 },
+      },
+      required: ["body"],
+      additionalProperties: false,
+    },
+  },
+  "linear.status": {
+    name: "linear_status",
+    description:
+      'Moves the Linear issue to another workflow state, by its name as it appears on the board (for example "In Review" or "Done"). Use it when the work reaches that state, never to close an issue someone else still has to accept.',
+    inputSchema: {
+      type: "object",
+      properties: { state: { type: "string", minLength: 1 } },
+      required: ["state"],
+      additionalProperties: false,
+    },
+  },
   "linear.link": {
     name: "linear_link",
     description: "Adds an external link (for example a pull request) to the Linear session.",
@@ -113,6 +144,8 @@ export const LINEAR_OUTPUT_TYPES: readonly LinearOutputType[] = [
   "linear.ask",
   "linear.plan",
   "linear.link",
+  "linear.comment",
+  "linear.status",
 ];
 
 export function linearOutputTool(type: string): OutputToolDefinition | undefined {
@@ -125,6 +158,8 @@ export const LINEAR_SESSION_OUTPUT_TYPES = [
   "linear.ask",
   "linear.plan",
   "linear.link",
+  "linear.comment",
+  "linear.status",
 ] as const;
 
 /** Session outputs need a session to write to; issue and comment contexts never expose them. */
@@ -164,6 +199,11 @@ const PlanArgsSchema = z.object({
     )
     .max(100),
 });
+const CommentArgsSchema = z.object({
+  body: z.string().min(1),
+  replyToCommentId: z.string().min(1).optional(),
+});
+const StatusArgsSchema = z.object({ state: z.string().min(1) });
 const LinkArgsSchema = z.object({
   label: z.string().min(1),
   url: z.string().regex(/^https:\/\//u),
@@ -174,6 +214,8 @@ export interface LinearAgentOutputExecutors {
   ask: OutputExecutor;
   plan: OutputExecutor;
   link: OutputExecutor;
+  comment: OutputExecutor;
+  status: OutputExecutor;
 }
 
 /**
@@ -184,7 +226,12 @@ export interface LinearAgentOutputExecutors {
 export function createLinearAgentOutputExecutors(options: {
   coordinator: Pick<
     LinearSessionCoordinator,
-    "emit" | "updateSession" | "publishPullRequest" | "answerThreadReply"
+    | "emit"
+    | "updateSession"
+    | "publishPullRequest"
+    | "answerThreadReply"
+    | "postComment"
+    | "transitionIssue"
   >;
   database: Pick<Database, "findLinearAgentSession">;
 }): LinearAgentOutputExecutors {
@@ -234,6 +281,26 @@ export function createLinearAgentOutputExecutors(options: {
       if (result === "failed" || result === "dropped") {
         throw new Error("The Linear session plan could not be updated; try again.");
       }
+    },
+    async comment(input) {
+      const args = CommentArgsSchema.parse(input.args);
+      const context = LinearSessionOutputContextSchema.parse(input.outputContext);
+      await options.coordinator.postComment({
+        linearOrganizationId: context.linearOrganizationId,
+        issueId: context.issueId,
+        body: args.body,
+        ...(args.replyToCommentId === undefined ? {} : { parentId: args.replyToCommentId }),
+      });
+    },
+    async status(input) {
+      const args = StatusArgsSchema.parse(input.args);
+      const context = LinearSessionOutputContextSchema.parse(input.outputContext);
+      await options.coordinator.transitionIssue({
+        linearOrganizationId: context.linearOrganizationId,
+        issueId: context.issueId,
+        teamId: context.teamId,
+        selector: { kind: "name", name: args.state },
+      });
     },
     async link(input) {
       const args = LinkArgsSchema.parse(input.args);
