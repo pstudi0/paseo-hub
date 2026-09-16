@@ -182,7 +182,10 @@ export interface LinearAgentOutputExecutors {
  * throws so the tool call is released and the agent can retry.
  */
 export function createLinearAgentOutputExecutors(options: {
-  coordinator: Pick<LinearSessionCoordinator, "emit" | "updateSession" | "publishPullRequest">;
+  coordinator: Pick<
+    LinearSessionCoordinator,
+    "emit" | "updateSession" | "publishPullRequest" | "answerThreadReply"
+  >;
   database: Pick<Database, "findLinearAgentSession">;
 }): LinearAgentOutputExecutors {
   return {
@@ -196,6 +199,12 @@ export function createLinearAgentOutputExecutors(options: {
         ephemeral: false,
       });
       assertSent(result, "linear.response");
+      // The person may have asked from a comment thread; the answer belongs there too.
+      await options.coordinator.answerThreadReply(
+        context.sessionId,
+        context.linearOrganizationId,
+        args.content,
+      );
     },
     async ask(input) {
       const args = AskArgsSchema.parse(input.args);

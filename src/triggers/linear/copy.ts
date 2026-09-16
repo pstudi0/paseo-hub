@@ -12,6 +12,8 @@ export const LINEAR_COPY = {
   followUpUndeliverable:
     "The follow-up could not be delivered to the running agent; it will be delivered on the next run.",
   stillWorking: "Still working…",
+  /** The placeholder reply posted in a human thread, later rewritten with the answer. */
+  workingInThread: "Working…",
   turnFailed: (error: string): string => `The agent's turn failed: ${error}`,
   dropNoProject:
     "No Paseo project is configured for this team. Add a linear.agent_session_created trigger with this team's ID, or check the trigger's from_users allowlist.",

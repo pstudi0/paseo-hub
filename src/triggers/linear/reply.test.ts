@@ -44,7 +44,12 @@ describe("Linear reply output", () => {
 class RecordingLinearClient implements Pick<LinearApiClient, "createComment"> {
   comments: Array<{ linearOrganizationId: string; issueId: string; body: string }> = [];
 
-  async createComment(input: (typeof this.comments)[number]): Promise<void> {
+  async createComment(input: {
+    linearOrganizationId: string;
+    issueId: string;
+    body: string;
+  }): Promise<{ id: string }> {
     this.comments.push(input);
+    return { id: `comment-${String(this.comments.length)}` };
   }
 }

@@ -100,7 +100,7 @@ describe("Linear session coordinator", () => {
     assert.equal(await world.coordinator.followUp(promptedEvent(), sessionInput()), "dispatch");
   });
 
-  it("opens a session on the commented thread when the prompt comes from another thread", async () => {
+  it("answers in the commented thread instead of taking the thread over", async () => {
     const world = createWorld();
     await world.coordinator.acknowledge(createdEvent(), sessionInput());
     world.executions.set("exec-1", execution("exec-1", "running", "agent-1"));
@@ -111,20 +111,31 @@ describe("Linear session coordinator", () => {
     world.client.threadRoot = LINEAR_FIXTURE.mentionCommentId;
 
     const prompted = promptedEvent("Add tests", LINEAR_FIXTURE.previousCommentId);
-    assert.equal(await world.coordinator.followUp(prompted, sessionInput()), "forked");
+    assert.equal(await world.coordinator.followUp(prompted, sessionInput()), "steered");
+    // The thread gets an ordinary reply straight away; no session is attached to it.
     assert.deepEqual(
-      world.client.calls.filter((call) => call.method === "createAgentSessionOnComment"),
-      [
-        {
-          method: "createAgentSessionOnComment",
-          input: {
-            linearOrganizationId: LINEAR_FIXTURE.organizationId,
-            commentId: LINEAR_FIXTURE.mentionCommentId,
-          },
-        },
-      ],
+      world.client.calls.filter((call) => call.method === "createAgentSessionOnIssue"),
+      [],
     );
-    assert.equal(world.control.steers.length, 0);
+    assert.deepEqual(
+      world.client.calls
+        .filter((call) => call.method === "createComment")
+        .map((call) => ({ parentId: field(call, "parentId"), body: field(call, "body") })),
+      [{ parentId: LINEAR_FIXTURE.mentionCommentId, body: LINEAR_COPY.workingInThread }],
+    );
+
+    // The session's answer rewrites that same comment rather than adding another one.
+    await world.coordinator.answerThreadReply(
+      LINEAR_FIXTURE.sessionId,
+      LINEAR_FIXTURE.organizationId,
+      "Tests ajoutés.",
+    );
+    assert.deepEqual(
+      world.client.calls
+        .filter((call) => call.method === "updateComment")
+        .map((call) => field(call, "body")),
+      ["Tests ajoutés."],
+    );
   });
 
   it("queues a follow-up while the agent is still spawning", async () => {
@@ -177,14 +188,15 @@ describe("Linear thread replies without a mention", () => {
       newCommentNotification(LINEAR_FIXTURE.rootCommentId),
       claim(),
     );
+    // The session is opened on the issue, never on the human thread, which stays readable.
     assert.deepEqual(
-      world.client.calls.filter((call) => call.method === "createAgentSessionOnComment"),
+      world.client.calls.filter((call) => call.method === "createAgentSessionOnIssue"),
       [
         {
-          method: "createAgentSessionOnComment",
+          method: "createAgentSessionOnIssue",
           input: {
             linearOrganizationId: LINEAR_FIXTURE.organizationId,
-            commentId: LINEAR_FIXTURE.rootCommentId,
+            issueId: LINEAR_FIXTURE.issueId,
           },
         },
       ],
@@ -210,7 +222,7 @@ describe("Linear thread replies without a mention", () => {
     await world.coordinator.applyLifecycle(newCommentNotification(null), claim());
 
     assert.deepEqual(
-      world.client.calls.filter((call) => call.method === "createAgentSessionOnComment"),
+      world.client.calls.filter((call) => call.method === "createAgentSessionOnIssue"),
       [],
     );
   });
@@ -606,15 +618,22 @@ class RecordingClient {
     const client: LinearApiClient = {
       readIssue: unsupported,
       readIssueComments: unsupported,
-      createComment: unsupported,
+      createComment: (input) => {
+        this.calls.push({ method: "createComment", input: asRecord(input) });
+        return Promise.resolve({ id: "thread-reply-1" });
+      },
       createAgentActivity: (input) => this.createAgentActivity(input),
       updateAgentSession: (input) => this.updateAgentSession(input),
       readAgentSessionActivities: unsupported,
       readCommentThreadRoot: () => Promise.resolve(this.threadRoot),
       readCommentThreadAuthors: () => Promise.resolve(this.threadAuthors),
-      createAgentSessionOnComment: (input) => {
-        this.calls.push({ method: "createAgentSessionOnComment", input: asRecord(input) });
-        return Promise.resolve({ id: "session-on-comment" });
+      createAgentSessionOnIssue: (input) => {
+        this.calls.push({ method: "createAgentSessionOnIssue", input: asRecord(input) });
+        return Promise.resolve({ id: "session-on-issue" });
+      },
+      updateComment: (input) => {
+        this.calls.push({ method: "updateComment", input: asRecord(input) });
+        return Promise.resolve();
       },
       readTeamStates: () => this.readTeamStates(),
       updateIssue: (input) => this.updateIssue(input),

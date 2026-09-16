@@ -73,7 +73,7 @@ export type LinearFollowUpOutcome =
   | "queued"
   | "answered_permission"
   | "stopped"
-  | "forked"
+  | "echoed"
   | "dispatch";
 
 /**
@@ -138,7 +138,7 @@ export class LinearSessionCoordinator {
       await this.stop(record, activity.user.name);
       return "stopped";
     }
-    if (await this.forkOntoComment(event, activity)) return "forked";
+    await this.echoIntoThread(event, activity);
     if (record.pendingPermission !== null) {
       void this.answerPermission(record, record.pendingPermission, activity.body).catch(
         (error: unknown) => this.report(error, "linear.permission.answer", record),
@@ -190,10 +190,12 @@ export class LinearSessionCoordinator {
         rootCommentId,
       });
       if (!authors.includes(event.appUserId)) return;
+      const issueId = event.notification.issueId;
+      if (issueId === undefined) return;
       const opened = await this.retryOnDeadlock(() =>
-        client.createAgentSessionOnComment({
+        client.createAgentSessionOnIssue({
           linearOrganizationId: event.organizationId,
-          commentId: rootCommentId,
+          issueId,
         }),
       );
       logger.info(
@@ -205,39 +207,65 @@ export class LinearSessionCoordinator {
     }
   }
 
-  private async forkOntoComment(
+  /**
+   * A prompt written in a comment thread is answered in that thread, the way any teammate would.
+   * Attaching a session to the thread is not an option: Linear then renders the whole thread as an
+   * agent session and the human messages stop being visible. So the agent posts an ordinary reply
+   * straight away, which is its visible acknowledgement, and rewrites that same comment with its
+   * answer once the run reaches a conclusion. The detailed activity stays in the session.
+   */
+  private async echoIntoThread(
     event: NormalizedLinearAgentSessionEvent,
     activity: NonNullable<NormalizedLinearAgentSessionEvent["activity"]>,
-  ): Promise<boolean> {
+  ): Promise<void> {
     const client = this.options.state.client;
     const sourceCommentId = activity.sourceCommentId;
-    if (client === undefined || sourceCommentId === null) return false;
+    const issueId = event.session.issue?.id;
+    if (client === undefined || sourceCommentId === null || issueId === undefined) return;
     try {
       const root = await client.readCommentThreadRoot({
         linearOrganizationId: event.organizationId,
         commentId: sourceCommentId,
       });
-      if (root === undefined || root === event.session.commentId) return false;
-      // Linear is still writing the prompt activity onto the other session when we ask it to open
-      // a session on the same comment, and reports the lock conflict as DEADLOCK_DETECTED.
-      const forked = await this.retryOnDeadlock(() =>
-        client.createAgentSessionOnComment({
-          linearOrganizationId: event.organizationId,
-          commentId: root,
-        }),
-      );
-      logger.info(
-        { sessionId: event.session.id, forkedSessionId: forked.id, commentId: root },
-        "opened a Linear agent session on the commented thread",
-      );
-      return true;
+      // A prompt typed in the session's own thread already has the session for an answer.
+      if (root === undefined || root === event.session.commentId) return;
+      const placeholder = await client.createComment({
+        linearOrganizationId: event.organizationId,
+        issueId,
+        body: LINEAR_COPY.workingInThread,
+        parentId: root,
+      });
+      this.options.state.threadReplies.set(event.session.id, {
+        commentId: placeholder.id,
+        issueId,
+      });
     } catch (error) {
-      // The answer still reaches the session's own thread; losing the fork is not losing the reply.
-      this.report(error, "linear.session.fork");
-      return false;
+      this.report(error, "linear.thread_reply.open");
     }
   }
 
+  /**
+   * Hands a session's conclusion to the comment thread that asked for it, if one is waiting, by
+   * rewriting the placeholder the agent posted there. Called for every terminal answer, so a
+   * thread never stays on "Working…".
+   */
+  async answerThreadReply(
+    sessionId: string,
+    linearOrganizationId: string,
+    body: string,
+  ): Promise<void> {
+    const pending = this.options.state.threadReplies.get(sessionId);
+    const client = this.options.state.client;
+    if (pending === undefined || client === undefined) return;
+    this.options.state.threadReplies.delete(sessionId);
+    try {
+      await client.updateComment({ linearOrganizationId, commentId: pending.commentId, body });
+    } catch (error) {
+      this.report(error, "linear.thread_reply.answer");
+    }
+  }
+
+  /** Linear reports a lock conflict on a comment it is still writing to as DEADLOCK_DETECTED. */
   private async retryOnDeadlock<T>(operation: () => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -249,7 +277,7 @@ export class LinearSessionCoordinator {
         await new Promise<void>((resolve) => {
           (this.options.setTimeout ?? globalThis.setTimeout)(
             () => resolve(),
-            LINEAR_DEADLOCK_RETRY_DELAYS_MS[attempt] ?? 3_000,
+            LINEAR_DEADLOCK_RETRY_DELAYS_MS[attempt] ?? 5_000,
           );
         });
       }

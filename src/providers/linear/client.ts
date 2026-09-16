@@ -60,8 +60,14 @@ export const LINEAR_GRAPHQL_DOCUMENTS = {
       }
     }
   }`,
-  commentCreate: `mutation PaseoComment($issueId: String!, $body: String!) {
-    commentCreate(input: { issueId: $issueId, body: $body }) { success }
+  commentCreate: `mutation PaseoComment($issueId: String!, $body: String!, $parentId: String) {
+    commentCreate(input: { issueId: $issueId, body: $body, parentId: $parentId }) {
+      success
+      comment { id }
+    }
+  }`,
+  commentUpdate: `mutation PaseoCommentUpdate($id: String!, $body: String!) {
+    commentUpdate(id: $id, input: { body: $body }) { success }
   }`,
   agentActivityCreate: `mutation PaseoAgentActivityCreate($input: AgentActivityCreateInput!) {
     agentActivityCreate(input: $input) { success agentActivity { id } }
@@ -79,8 +85,8 @@ export const LINEAR_GRAPHQL_DOCUMENTS = {
       children(first: 100) { nodes { id user { id } } }
     }
   }`,
-  agentSessionCreateOnComment: `mutation PaseoAgentSessionCreateOnComment($commentId: String!) {
-    agentSessionCreateOnComment(input: { commentId: $commentId }) {
+  agentSessionCreateOnIssue: `mutation PaseoAgentSessionCreateOnIssue($issueId: String!) {
+    agentSessionCreateOnIssue(input: { issueId: $issueId }) {
       success
       agentSession { id }
     }
@@ -211,8 +217,15 @@ const IssueCommentHistoryResponseSchema = z.object({
 
 const CommentResponseSchema = z.object({
   data: z.object({
-    commentCreate: z.object({ success: z.literal(true) }),
+    commentCreate: z.object({
+      success: z.literal(true),
+      comment: z.object({ id: z.string() }),
+    }),
   }),
+});
+
+const CommentUpdateResponseSchema = z.object({
+  data: z.object({ commentUpdate: z.object({ success: z.boolean() }) }),
 });
 
 const AgentActivityCreateResponseSchema = z.object({
@@ -247,7 +260,7 @@ const CommentThreadAuthorsResponseSchema = z.object({
 
 const AgentSessionCreateResponseSchema = z.object({
   data: z.object({
-    agentSessionCreateOnComment: z.object({
+    agentSessionCreateOnIssue: z.object({
       success: z.boolean(),
       agentSession: z.object({ id: z.string() }),
     }),
@@ -455,9 +468,17 @@ export interface LinearApiClient {
     issueId: string;
     beforeCreatedAt: string;
   }): Promise<LinearIssueCommentHistory>;
+  /** Posts an issue comment; `parentId` makes it a reply inside that thread. */
   createComment(input: {
     linearOrganizationId: string;
     issueId: string;
+    body: string;
+    parentId?: string;
+  }): Promise<{ id: string }>;
+  /** Rewrites a comment the app user owns, so a placeholder can become the final answer. */
+  updateComment(input: {
+    linearOrganizationId: string;
+    commentId: string;
     body: string;
   }): Promise<void>;
   /**
@@ -511,13 +532,15 @@ export interface LinearApiClient {
     linearOrganizationId: string;
     rootCommentId: string;
   }): Promise<readonly string[]>;
+
   /**
-   * Opens an agent session on a comment thread so the agent's activities and its answer render
-   * under that comment, instead of in the thread of a session Linear reused for the issue.
+   * Opens an agent session on the issue itself, in a thread of its own. Used when a person writes
+   * to the agent outside any session: it gives the run somewhere to report without taking over
+   * the human thread, which keeps that conversation readable.
    */
-  createAgentSessionOnComment(input: {
+  createAgentSessionOnIssue(input: {
     linearOrganizationId: string;
-    commentId: string;
+    issueId: string;
   }): Promise<{ id: string }>;
   /** A team's workflow states in display order; callers pick by `type` (for example `started`). */
   readTeamStates(input: {
@@ -801,6 +824,22 @@ export function createLinearApiClient(options: {
         complete: !issue.comments.pageInfo.hasPreviousPage,
       };
     },
+    async updateComment(input) {
+      const result = CommentUpdateResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.commentUpdate,
+            variables: { id: input.commentId, body: input.body },
+          },
+          transport,
+        ),
+      );
+      if (!result.data.commentUpdate.success) {
+        throw new Error("Linear did not accept the comment update");
+      }
+    },
     async createComment(input) {
       const result = CommentResponseSchema.parse(
         await graphql(
@@ -808,12 +847,17 @@ export function createLinearApiClient(options: {
           await accessTokenFor(input.linearOrganizationId),
           {
             query: LINEAR_GRAPHQL_DOCUMENTS.commentCreate,
-            variables: { issueId: input.issueId, body: input.body },
+            variables: {
+              issueId: input.issueId,
+              body: input.body,
+              parentId: input.parentId ?? null,
+            },
           },
           transport,
         ),
       );
       if (!result.data.commentCreate.success) throw new Error("Linear comment was not accepted");
+      return { id: result.data.commentCreate.comment.id };
     },
     async createAgentActivity(input) {
       const result = AgentActivityCreateResponseSchema.parse(
@@ -929,22 +973,22 @@ export function createLinearApiClient(options: {
         .filter((user) => user !== null)
         .map((user) => user.id);
     },
-    async createAgentSessionOnComment(input) {
+    async createAgentSessionOnIssue(input) {
       const result = AgentSessionCreateResponseSchema.parse(
         await graphql(
           request,
           await accessTokenFor(input.linearOrganizationId),
           {
-            query: LINEAR_GRAPHQL_DOCUMENTS.agentSessionCreateOnComment,
-            variables: { commentId: input.commentId },
+            query: LINEAR_GRAPHQL_DOCUMENTS.agentSessionCreateOnIssue,
+            variables: { issueId: input.issueId },
           },
           transport,
         ),
       );
-      if (!result.data.agentSessionCreateOnComment.success) {
-        throw new Error("Linear refused to open an agent session on the comment");
+      if (!result.data.agentSessionCreateOnIssue.success) {
+        throw new Error("Linear refused to open an agent session on the issue");
       }
-      return { id: result.data.agentSessionCreateOnComment.agentSession.id };
+      return { id: result.data.agentSessionCreateOnIssue.agentSession.id };
     },
     async readTeamStates(input) {
       const result = TeamStatesResponseSchema.parse(

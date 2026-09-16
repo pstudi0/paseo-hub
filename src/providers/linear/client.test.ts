@@ -271,7 +271,7 @@ describe("Linear connection client", () => {
           authorization: new Headers(init?.headers).get("authorization"),
           body: readableBody(init?.body),
         });
-        return json({ data: { commentCreate: { success: true } } });
+        return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
       },
     });
 
@@ -315,7 +315,7 @@ describe("Linear connection client", () => {
         tokenRequests += 1;
         return json({ access_token: "fresh-token" });
       }
-      return json({ data: { commentCreate: { success: true } } });
+      return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
     };
     const updateTokens = async (update: UpdateLinearConnectionTokensInput) => {
       updates.push(update);
@@ -416,7 +416,7 @@ describe("Linear connection client", () => {
       now: () => new Date(1_700_000_010_000),
       fetch: async (_url, init) => {
         requests.push(new Headers(init?.headers).get("authorization") ?? "");
-        return json({ data: { commentCreate: { success: true } } });
+        return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
       },
     });
 
@@ -522,7 +522,7 @@ describe("Linear connection client", () => {
       now: () => new Date(1_700_000_010_000),
       fetch: async (_url: RequestInfo | URL, init?: RequestInit) => {
         requests.push(new Headers(init?.headers).get("authorization") ?? "");
-        return json({ data: { commentCreate: { success: true } } });
+        return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
       },
     };
     const firstProcess = createLinearApiClient(sharedOptions);
@@ -983,13 +983,14 @@ describe("Linear API client contracts", () => {
     assert.deepEqual(Object.keys(LINEAR_GRAPHQL_DOCUMENTS).sort(), [
       "agentActivityCreate",
       "agentSessionActivities",
-      "agentSessionCreateOnComment",
+      "agentSessionCreateOnIssue",
       "agentSessionUpdate",
       "attachmentLinkGitHubPR",
       "attachmentLinkURL",
       "commentCreate",
       "commentThreadAuthors",
       "commentThreadRoot",
+      "commentUpdate",
       "issue",
       "issueCommentHistory",
       "issueUpdate",
