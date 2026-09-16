@@ -24,7 +24,7 @@ import {
   type LinearOutboundActivity,
 } from "./activity-queue.js";
 import { LINEAR_COPY } from "./copy.js";
-import type { NormalizedLinearAgentSessionEvent } from "./events.js";
+import { linearSessionSource, type NormalizedLinearAgentSessionEvent } from "./events.js";
 import type { LinearLifecycleEvent } from "./lifecycle-events.js";
 import type { LinearSessionState } from "./session-state.js";
 
@@ -114,6 +114,12 @@ export class LinearSessionCoordinator {
           { label: "Paseo Hub", url: `${this.options.publicBaseUrl}/o/${slug}/activity` },
         ],
       });
+    }
+    // Work someone delegated ends with a plain comment on the issue: the session card is a
+    // developer's view, and the team reads the comment stream.
+    const issueId = event.session.issue?.id;
+    if (issueId !== undefined && linearSessionSource(event) !== "mention") {
+      this.options.state.conclusions.set(event.session.id, issueId);
     }
     // A mention written inside a human thread makes Linear open the session on that reply, so the
     // thread itself would only ever show a session card. Answer where the person is looking.
@@ -298,14 +304,24 @@ export class LinearSessionCoordinator {
     linearOrganizationId: string,
     body: string,
   ): Promise<void> {
-    const pending = this.options.state.threadReplies.get(sessionId);
     const client = this.options.state.client;
-    if (pending === undefined || client === undefined) return;
-    this.options.state.threadReplies.delete(sessionId);
+    if (client === undefined) return;
+    const pending = this.options.state.threadReplies.get(sessionId);
+    if (pending !== undefined) {
+      this.options.state.threadReplies.delete(sessionId);
+      try {
+        await client.updateComment({ linearOrganizationId, commentId: pending.commentId, body });
+      } catch (error) {
+        this.report(error, "linear.thread_reply.answer");
+      }
+    }
+    const issueId = this.options.state.conclusions.get(sessionId);
+    if (issueId === undefined) return;
+    this.options.state.conclusions.delete(sessionId);
     try {
-      await client.updateComment({ linearOrganizationId, commentId: pending.commentId, body });
+      await client.createComment({ linearOrganizationId, issueId, body });
     } catch (error) {
-      this.report(error, "linear.thread_reply.answer");
+      this.report(error, "linear.conclusion.post");
     }
   }
 

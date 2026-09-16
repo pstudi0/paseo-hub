@@ -20,6 +20,13 @@ export interface LinearSessionState {
    * "Working…" and is rewritten with the result; the session keeps the detailed activity.
    */
   readonly threadReplies: Map<string, LinearThreadReply>;
+  /**
+   * Issues whose delegated work owes a closing comment, by Linear session id. A session card is
+   * only opened by the people who look for it, so work someone delegated also ends with an
+   * ordinary comment on the issue: that is what the rest of the team reads, and what tells them
+   * the issue has been handled.
+   */
+  readonly conclusions: Map<string, string>;
   /** The API client of the active registration; resolved at send time, never at enqueue. */
   client: LinearApiClient | undefined;
 }
@@ -37,6 +44,7 @@ export function createLinearSessionState(): LinearSessionState {
     keepalives: new Map(),
     planShapes: new Map(),
     threadReplies: new Map(),
+    conclusions: new Map(),
     client: undefined,
   };
 }

@@ -262,10 +262,17 @@ describe("Linear agent outputs", () => {
       args: { content: "Done: PR opened." },
       outputContext: outputContext(),
     });
-    const call = world.client.calls.at(-1);
+    const call = world.client.calls.findLast((entry) => entry.method === "createAgentActivity");
     assert.equal(field(call, "id"), "9b2f6e2a-2b4e-4d1e-8c3a-1f2e3d4c5b6a");
     assert.deepEqual(field(call, "content"), { type: "response", body: "Done: PR opened." });
     assert.equal(field(call, "ephemeral"), false);
+    // Delegated work also closes with a plain comment, so the team sees the issue was handled.
+    assert.deepEqual(
+      world.client.calls
+        .filter((entry) => entry.method === "createComment")
+        .map((entry) => ({ parentId: field(entry, "parentId"), body: field(entry, "body") })),
+      [{ parentId: undefined, body: "Done: PR opened." }],
+    );
     const record = await world.database.findLinearAgentSession(LINEAR_FIXTURE.sessionId);
     assert.equal(record?.mirrorStatus, "complete");
     assert.notEqual(record?.respondedAt, null);
