@@ -50,10 +50,14 @@ export interface LinearWebhookSourceOptions {
   /** Permission changes, revocation and inbox notifications; ignored without it. */
   lifecycle?: {
     claim(input: LinearLifecycleReceiptClaimInput): Promise<LinearLifecycleReceiptClaim>;
+    /**
+     * Returns a session prompt when the lifecycle event is really a message for the agent, so it
+     * reaches the issue's existing session instead of opening another one.
+     */
     apply(
       event: LinearLifecycleEvent,
       claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
-    ): Promise<void>;
+    ): Promise<NormalizedLinearAgentSessionEvent | undefined>;
   };
 }
 
@@ -136,7 +140,8 @@ async function handoffLinearEvent(
 ): Promise<Response> {
   try {
     const lifecycle = parseLinearLifecycleEvent(verified.eventName, verified.payload);
-    if (lifecycle !== undefined) return await applyLinearLifecycle(lifecycle, verified, options);
+    if (lifecycle !== undefined)
+      return await applyLinearLifecycle(lifecycle, verified, handlers, options);
     let event = normalizeLinearEvent(verified.payload, verified.eventName);
     if (event === undefined) {
       logger.info({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
@@ -331,6 +336,7 @@ async function dispatchLinearSession(
 async function applyLinearLifecycle(
   event: LinearLifecycleEvent,
   verified: VerifiedLinearRequest,
+  handlers: Set<TriggerHandler>,
   options: LinearWebhookSourceOptions,
 ): Promise<Response> {
   if (options.lifecycle === undefined) {
@@ -355,8 +361,9 @@ async function applyLinearLifecycle(
     );
     return new Response("OK", { status: 200 });
   }
-  await options.lifecycle.apply(event, claim);
-  return new Response("OK", { status: 200 });
+  const prompt = await options.lifecycle.apply(event, claim);
+  if (prompt === undefined) return new Response("OK", { status: 200 });
+  return acceptAndDispatchLinearSession(prompt, verified, handlers, options);
 }
 
 type LinearEventSource = "linear.issue" | "linear.comment" | "linear.agent_session";

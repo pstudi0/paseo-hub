@@ -10,7 +10,7 @@ import type {
   LinearPendingPrompt,
   UpsertLinearAgentSessionInput,
 } from "../../db/types.js";
-import type { LinearApiClient } from "../../providers/linear/client.js";
+import type { LinearApiClient, LinearIssueDetails } from "../../providers/linear/client.js";
 import {
   fixtureRecord,
   LINEAR_FIXTURE,
@@ -181,50 +181,44 @@ describe("Linear session coordinator", () => {
 });
 
 describe("Linear thread replies without a mention", () => {
-  it("wakes the agent on a reply in a thread it already wrote in", async () => {
+  it("routes a reply in its own thread into the issue's existing session", async () => {
     const world = createWorld();
     world.client.threadAuthors = [LINEAR_FIXTURE.appUserId, LINEAR_FIXTURE.humanId];
-    await world.coordinator.applyLifecycle(
+    await world.coordinator.acknowledge(createdEvent(), sessionInput());
+    const prompt = await world.coordinator.applyLifecycle(
       newCommentNotification(LINEAR_FIXTURE.rootCommentId),
       claim(),
     );
-    // The session is opened on the issue, never on the human thread, which stays readable.
+    assert.equal(prompt?.action, "prompted");
+    assert.equal(prompt?.session.id, LINEAR_FIXTURE.sessionId);
+    assert.equal(prompt?.activity?.body, "Et la suite ?");
+    // No new session: the message joins the work already under way on this issue.
     assert.deepEqual(
       world.client.calls.filter((call) => call.method === "createAgentSessionOnIssue"),
-      [
-        {
-          method: "createAgentSessionOnIssue",
-          input: {
-            linearOrganizationId: LINEAR_FIXTURE.organizationId,
-            issueId: LINEAR_FIXTURE.issueId,
-          },
-        },
-      ],
+      [],
     );
   });
 
   it("stays out of a thread it never wrote in, and out of its own replies", async () => {
     const world = createWorld();
+    await world.coordinator.acknowledge(createdEvent(), sessionInput());
+
     world.client.threadAuthors = [LINEAR_FIXTURE.humanId, LINEAR_FIXTURE.otherHumanId];
-    await world.coordinator.applyLifecycle(
+    const foreign = await world.coordinator.applyLifecycle(
       newCommentNotification(LINEAR_FIXTURE.rootCommentId),
       claim(),
     );
 
     world.client.threadAuthors = [LINEAR_FIXTURE.appUserId];
-    await world.coordinator.applyLifecycle(
+    const own = await world.coordinator.applyLifecycle(
       newCommentNotification(LINEAR_FIXTURE.rootCommentId, LINEAR_FIXTURE.appUserId),
       claim(),
     );
 
     // A root comment carries no thread to join.
-    world.client.threadAuthors = [LINEAR_FIXTURE.appUserId];
-    await world.coordinator.applyLifecycle(newCommentNotification(null), claim());
+    const root = await world.coordinator.applyLifecycle(newCommentNotification(null), claim());
 
-    assert.deepEqual(
-      world.client.calls.filter((call) => call.method === "createAgentSessionOnIssue"),
-      [],
-    );
+    assert.deepEqual([foreign, own, root], [undefined, undefined, undefined]);
   });
 });
 
@@ -463,6 +457,11 @@ function newCommentNotification(
       actorId,
       commentId: LINEAR_FIXTURE.previousCommentId,
       parentCommentId,
+      comment: {
+        id: LINEAR_FIXTURE.previousCommentId,
+        body: "Et la suite ?",
+        userId: actorId,
+      },
     },
     webhookId: LINEAR_FIXTURE.webhookId,
     createdAt: "2026-09-16T10:00:00.000Z",
@@ -610,13 +609,27 @@ class RecordingClient {
   threadRoot: string | undefined = undefined;
   /** Who already wrote in the thread; tests override it to allow or refuse a wake-up. */
   threadAuthors: readonly string[] = [];
+  /** The issue a routed thread reply rebuilds its session event from. */
+  issue: LinearIssueDetails | undefined = {
+    id: LINEAR_FIXTURE.issueId,
+    identifier: "LAB-42",
+    title: "Fix the flaky daemon reconnect test",
+    description: null,
+    url: "https://linear.app/acme/issue/LAB-42",
+    teamId: LINEAR_FIXTURE.teamId,
+    team: { id: LINEAR_FIXTURE.teamId, key: "LAB", name: "Lab" },
+    projectId: null,
+    stateId: null,
+    assigneeId: null,
+    labelIds: [],
+  };
   private inFlight: Promise<unknown>[] = [];
 
   /** The methods the coordinator calls; anything else throws when reached. */
   asApiClient(): LinearApiClient {
     const unsupported = () => Promise.reject(new Error("not recorded by this test"));
     const client: LinearApiClient = {
-      readIssue: unsupported,
+      readIssue: () => Promise.resolve(this.issue),
       readIssueComments: unsupported,
       createComment: (input) => {
         this.calls.push({ method: "createComment", input: asRecord(input) });

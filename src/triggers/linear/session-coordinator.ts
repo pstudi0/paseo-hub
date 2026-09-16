@@ -13,6 +13,7 @@ import { logger } from "../../logger.js";
 import {
   LinearApiError,
   type LinearActivityContent,
+  type LinearIssueDetails,
   type LinearPlanStep,
 } from "../../providers/linear/client.js";
 import type { ProviderEventDropReasonCode } from "../drop-reason.js";
@@ -176,34 +177,75 @@ export class LinearSessionCoordinator {
    * A reply posted in a thread without mentioning the agent produces no session event at all,
    * only this notification. Linear's own example agent answers exactly when the agent already
    * wrote in that thread, which keeps it out of conversations between people while letting it
-   * follow up on its own answers. Opening a session on the thread root is what makes its
-   * activities and its reply render under the comment.
+   * follow up on its own answers. Rather than opening yet another session, the message is turned
+   * into a prompt on the issue's existing session, so the agent keeps its context and its
+   * worktree; the webhook dispatches it like any other follow-up.
    */
-  private async wakeOnThreadReply(event: Extract<LinearLifecycleEvent, { kind: "notification" }>) {
+  private async promptFromThreadReply(
+    event: Extract<LinearLifecycleEvent, { kind: "notification" }>,
+  ): Promise<NormalizedLinearAgentSessionEvent | undefined> {
     const client = this.options.state.client;
-    const rootCommentId = event.notification.parentCommentId;
-    if (client === undefined || rootCommentId === null || rootCommentId === undefined) return;
-    if (event.notification.actorId === event.appUserId) return;
+    const { parentCommentId, issueId, actorId, comment } = event.notification;
+    if (client === undefined || comment === undefined) return undefined;
+    if (parentCommentId === null || parentCommentId === undefined) return undefined;
+    if (issueId === undefined || actorId === event.appUserId) return undefined;
     try {
       const authors = await client.readCommentThreadAuthors({
         linearOrganizationId: event.organizationId,
-        rootCommentId,
+        rootCommentId: parentCommentId,
       });
-      if (!authors.includes(event.appUserId)) return;
-      const issueId = event.notification.issueId;
-      if (issueId === undefined) return;
-      const opened = await this.retryOnDeadlock(() =>
-        client.createAgentSessionOnIssue({
-          linearOrganizationId: event.organizationId,
-          issueId,
-        }),
+      if (!authors.includes(event.appUserId)) return undefined;
+      const sessions = await this.options.database.listLinearAgentSessionsForIssue(
+        event.organizationId,
+        issueId,
       );
+      const record = sessions[0];
+      if (record === undefined) return undefined;
+      const issue = await client.readIssue({
+        linearOrganizationId: event.organizationId,
+        issueId,
+      });
+      const session = linearSessionIssue(issue, record);
+      if (session === undefined) return undefined;
       logger.info(
-        { commentId: rootCommentId, sessionId: opened.id },
-        "opened a Linear agent session on a reply in the agent's own thread",
+        { sessionId: record.linearSessionId, commentId: comment.id },
+        "routing a thread reply into the issue's existing Linear session",
       );
+      return {
+        type: "agent_session",
+        action: "prompted",
+        id: comment.id,
+        organizationId: event.organizationId,
+        appUserId: event.appUserId,
+        oauthClientId: event.oauthClientId,
+        session: {
+          id: record.linearSessionId,
+          status: "active",
+          url: null,
+          createdAt: record.createdAt.toISOString(),
+          commentId: null,
+          sourceCommentId: null,
+          creator: null,
+          issue: session,
+          comment: null,
+        },
+        promptContext: null,
+        guidance: [],
+        previousComments: [],
+        activity: {
+          id: comment.id,
+          body: comment.body,
+          createdAt: event.createdAt,
+          signal: null,
+          signalMetadata: null,
+          sourceCommentId: comment.id,
+          user: { id: actorId ?? event.appUserId },
+        },
+        occurredAt: event.createdAt,
+      };
     } catch (error) {
-      this.report(error, "linear.thread_reply.wake");
+      this.report(error, "linear.thread_reply.route");
+      return undefined;
     }
   }
 
@@ -352,14 +394,14 @@ export class LinearSessionCoordinator {
   async applyLifecycle(
     event: LinearLifecycleEvent,
     claim: Extract<LinearLifecycleReceiptClaim, { status: "claimed" }>,
-  ): Promise<void> {
+  ): Promise<NormalizedLinearAgentSessionEvent | undefined> {
     if (event.kind === "revoked") {
       await this.options.database.applyLinearLifecycle(claim, { kind: "revoked" });
       logger.info(
         { linearOrganizationId: claim.linearOrganizationId },
         "Linear app authorization revoked; connection requires reauthorization",
       );
-      return;
+      return undefined;
     }
     if (event.kind === "permission_change") {
       const connection = await this.options.database.findLinearConnection(
@@ -378,12 +420,12 @@ export class LinearSessionCoordinator {
         { linearOrganizationId: claim.linearOrganizationId, teamIds: teamAccess.teamIds },
         "Linear team access updated",
       );
-      return;
+      return undefined;
     }
     if (event.action === "issueNewComment") {
-      await this.wakeOnThreadReply(event);
+      const prompt = await this.promptFromThreadReply(event);
       await this.options.database.applyLinearLifecycle(claim, { kind: "noop" });
-      return;
+      return prompt;
     }
     if (event.action === "issueUnassignedFromYou" && event.notification.issueId !== undefined) {
       const sessions = await this.options.database.listLinearAgentSessionsForIssue(
@@ -402,6 +444,7 @@ export class LinearSessionCoordinator {
       { linearOrganizationId: claim.linearOrganizationId, action: event.action },
       "Linear app user notification received",
     );
+    return undefined;
   }
 
   emit(
@@ -750,6 +793,29 @@ function permissionResponse(
     return { behavior: "allow", updatedPermissions: [...pending.suggestions] };
   }
   return { behavior: "allow", ...selected };
+}
+
+/**
+ * The issue shape a normalized session event needs, drawn from the live issue with the stored
+ * session row as a fallback. Undefined when Linear gives us too little to build a valid event.
+ */
+function linearSessionIssue(
+  issue: LinearIssueDetails | undefined,
+  record: LinearAgentSessionRecord,
+): NonNullable<NormalizedLinearAgentSessionEvent["session"]["issue"]> | undefined {
+  const identifier = issue?.identifier ?? record.issueIdentifier;
+  const teamId = issue?.teamId ?? record.teamId;
+  if (issue === undefined || identifier === null || identifier === undefined) return undefined;
+  if (issue.url === undefined || issue.team === undefined) return undefined;
+  return {
+    id: record.issueId,
+    identifier,
+    title: issue.title,
+    description: issue.description,
+    url: issue.url,
+    teamId,
+    team: issue.team,
+  };
 }
 
 export function targetOf(record: LinearAgentSessionRecord): LinearSessionTarget {
