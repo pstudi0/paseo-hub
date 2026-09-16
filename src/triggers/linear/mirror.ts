@@ -10,6 +10,7 @@ import { reportFailure } from "../../failures/index.js";
 import type { LinearPlanStep } from "../../providers/linear/client.js";
 import type { AgentStreamNotification } from "../index.js";
 import { deriveLinearActivityId } from "./activity-id.js";
+import type { LinearSessionState } from "./session-state.js";
 import type { LinearOutboundActivity } from "./activity-queue.js";
 import { LINEAR_COPY } from "./copy.js";
 import type { LinearOutputContext, LinearTriggerContext } from "./provider.js";
@@ -112,6 +113,8 @@ interface MirrorDependencies {
   >;
   database: LinearMirrorDatabase;
   control: Pick<ExecutionControl, "daemonPermissions" | "readWorkspacePullRequest" | "steer">;
+  /** Reads Linear back before writing a fallback conclusion; absent in tests that never need it. */
+  state?: Pick<LinearSessionState, "client">;
   now?: () => number;
 }
 
@@ -162,8 +165,30 @@ export function createLinearMirror(options: MirrorDependencies): LinearMirror {
     if (updated !== undefined) records.set(executionId, { record: updated, readAt: now() });
   }
 
+  /**
+   * An agent that holds the app's own token can end its turn by writing the response activity
+   * itself, which the Hub never sees. Ask Linear before writing the fallback, so the session does
+   * not end with two conclusions.
+   */
+  async function sessionAlreadyAnswered(context: MirrorContext): Promise<boolean> {
+    const client = options.state?.client;
+    if (client === undefined) return false;
+    try {
+      const history = await client.readAgentSessionActivities({
+        linearOrganizationId: context.target.linearOrganizationId,
+        agentSessionId: context.target.sessionId,
+        beforeCreatedAt: new Date(now()).toISOString(),
+        excludeActivityId: null,
+      });
+      return history.activities.some((activity) => activity.content.type === "response");
+    } catch {
+      // Linear unreachable: prefer a duplicate conclusion to a session that ends on silence.
+      return false;
+    }
+  }
+
   async function handleTurnCompleted(context: MirrorContext): Promise<void> {
-    if (context.record.respondedAt === null) {
+    if (context.record.respondedAt === null && !(await sessionAlreadyAnswered(context))) {
       const body = lastMessages.get(context.input.executionId) ?? LINEAR_COPY.fallbackResponse;
       await options.coordinator.emit(context.target, {
         kind: "activity",

@@ -286,6 +286,7 @@ function createLinearSessions(input: {
     coordinator,
     database: input.database,
     control: input.control,
+    state: input.state,
   });
   const executors = createLinearAgentOutputExecutors({ coordinator, database: input.database });
   const outputs: ProviderOutputRegistration[] = (
