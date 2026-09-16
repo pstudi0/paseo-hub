@@ -339,24 +339,24 @@ describe("Linear mirror", () => {
       .map((call) => field(call, "content"));
     assert.deepEqual(activities.at(-3), {
       type: "action",
-      action: "Running",
+      action: "Exécution",
       parameter: "npm test",
     });
     // A tool call the daemon did not describe still reads as plain words, never "Bash Bash".
     assert.deepEqual(describeToolCall({ name: "Bash" }), {
-      verb: "Running",
-      parameter: "a command",
+      verb: "Exécution",
+      parameter: "d'une commande",
     });
     assert.deepEqual(describeToolCall({ name: "mcp__x__WebFetch" }), {
-      verb: "Reading",
-      parameter: "a web page",
+      verb: "Lecture",
+      parameter: "d'une page web",
     });
     assert.deepEqual(
       describeToolCall({
         name: "Bash",
         detail: { type: "shell", command: "git log --oneline -25 && ls docs" },
       }),
-      { verb: "Running", parameter: "git log" },
+      { verb: "Exécution", parameter: "git log" },
     );
     assert.deepEqual(activities.at(-2), { type: "thought", body: "Tests pass; wrapping up." });
     assert.deepEqual(activities.at(-1), { type: "response", body: "Tests pass; wrapping up." });

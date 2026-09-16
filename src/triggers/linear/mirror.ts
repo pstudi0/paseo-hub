@@ -457,40 +457,40 @@ function isHubTool(name: string): boolean {
 
 /** Paseo's own `detail.type`, the reliable signal when the daemon sends one. */
 const TOOL_VERBS: Readonly<Record<string, { verb: string; keys: readonly string[] }>> = {
-  shell: { verb: "Running", keys: ["command"] },
-  read: { verb: "Reading", keys: ["filePath"] },
-  edit: { verb: "Editing", keys: ["filePath"] },
-  write: { verb: "Editing", keys: ["filePath"] },
-  search: { verb: "Searching", keys: ["query"] },
-  fetch: { verb: "Reading", keys: ["url"] },
-  sub_agent: { verb: "Delegating", keys: ["description", "subAgentType"] },
+  shell: { verb: "Exécution", keys: ["command"] },
+  read: { verb: "Lecture", keys: ["filePath"] },
+  edit: { verb: "Modification", keys: ["filePath"] },
+  write: { verb: "Modification", keys: ["filePath"] },
+  search: { verb: "Recherche", keys: ["query"] },
+  fetch: { verb: "Lecture", keys: ["url"] },
+  sub_agent: { verb: "Délégation", keys: ["description", "subAgentType"] },
   plain_text: { verb: "", keys: ["text", "label"] },
-  plan: { verb: "Planning", keys: ["text"] },
-  worktree_setup: { verb: "Preparing", keys: ["branchName"] },
+  plan: { verb: "Plan", keys: ["text"] },
+  worktree_setup: { verb: "Préparation", keys: ["branchName"] },
 };
 
 /**
- * Plain words for the tools coding agents actually call, so the timeline reads to someone who
- * does not write code. Tool names vary between providers, so this is matched case-insensitively
- * and only used when the daemon sent no usable `detail`.
+ * Plain words for the tools coding agents actually call, so the timeline reads to someone who does
+ * not write code. Tool names vary between providers, so this is matched case-insensitively and
+ * only used when the daemon sent no usable `detail`.
  */
 const TOOL_NAMES: Readonly<Record<string, { verb: string; parameter: string }>> = {
-  bash: { verb: "Running", parameter: "a command" },
-  shell: { verb: "Running", parameter: "a command" },
-  read: { verb: "Reading", parameter: "a file" },
-  write: { verb: "Writing", parameter: "a file" },
-  edit: { verb: "Editing", parameter: "a file" },
-  multiedit: { verb: "Editing", parameter: "a file" },
-  notebookedit: { verb: "Editing", parameter: "a notebook" },
-  glob: { verb: "Searching", parameter: "the files" },
-  grep: { verb: "Searching", parameter: "the code" },
-  websearch: { verb: "Searching", parameter: "the web" },
-  webfetch: { verb: "Reading", parameter: "a web page" },
-  todowrite: { verb: "Updating", parameter: "its plan" },
-  task: { verb: "Delegating", parameter: "a sub-task" },
-  agent: { verb: "Delegating", parameter: "a sub-task" },
-  toolsearch: { verb: "Loading", parameter: "its tools" },
-  task_notification: { verb: "Running", parameter: "a command" },
+  bash: { verb: "Exécution", parameter: "d'une commande" },
+  shell: { verb: "Exécution", parameter: "d'une commande" },
+  task_notification: { verb: "Exécution", parameter: "d'une commande" },
+  read: { verb: "Lecture", parameter: "d'un fichier" },
+  write: { verb: "Écriture", parameter: "d'un fichier" },
+  edit: { verb: "Modification", parameter: "d'un fichier" },
+  multiedit: { verb: "Modification", parameter: "d'un fichier" },
+  notebookedit: { verb: "Modification", parameter: "d'un carnet" },
+  glob: { verb: "Recherche", parameter: "de fichiers" },
+  grep: { verb: "Recherche", parameter: "dans le code" },
+  websearch: { verb: "Recherche", parameter: "sur le web" },
+  webfetch: { verb: "Lecture", parameter: "d'une page web" },
+  todowrite: { verb: "Mise à jour", parameter: "de son plan" },
+  task: { verb: "Délégation", parameter: "d'une sous-tâche" },
+  agent: { verb: "Délégation", parameter: "d'une sous-tâche" },
+  toolsearch: { verb: "Chargement", parameter: "de ses outils" },
 };
 
 /** A shell command reads better as its program and first argument than as a full command line. */
@@ -514,7 +514,7 @@ export function describeToolCall(item: {
   if (detailed !== undefined) return detailed;
   // No usable detail: fall back to what the tool is commonly called.
   const shortName = item.name.split(/__|\./u).pop() ?? item.name;
-  return TOOL_NAMES[shortName.toLowerCase()] ?? { verb: "Running", parameter: shortName };
+  return TOOL_NAMES[shortName.toLowerCase()] ?? { verb: "Exécution", parameter: shortName };
 }
 
 /** The reliable path: Paseo told us what kind of tool call this is and what it acted on. */
@@ -547,10 +547,10 @@ function firstLine(value: string): string {
 
 function toolResult(item: { status: string; error?: unknown }): string {
   if (item.status === "failed") {
-    return truncate(`Failed: ${errorText(item.error)}`, LINEAR_MIRROR_RESULT_MAX_CHARS);
+    return truncate(`Échec : ${errorText(item.error)}`, LINEAR_MIRROR_RESULT_MAX_CHARS);
   }
-  if (item.status === "canceled") return "Canceled";
-  return "Done";
+  if (item.status === "canceled") return "Annulé";
+  return "Terminé";
 }
 
 function errorText(error: unknown): string {
@@ -560,7 +560,7 @@ function errorText(error: unknown): string {
     const message: unknown = error.message;
     if (typeof message === "string") return message;
   }
-  return "unknown error";
+  return "erreur inconnue";
 }
 
 function truncate(value: string, max: number): string {
