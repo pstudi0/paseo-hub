@@ -54,7 +54,7 @@ describe("workflow expression context", () => {
     );
     assert.throws(
       () => renderExecutionTemplate(template, "exec-1"),
-      /Linear issue identifier is unavailable/u,
+      /Linear session facts are unavailable/u,
     );
     assert.throws(
       () => validateExecutionTemplate(template),
@@ -74,7 +74,7 @@ describe("workflow expression context", () => {
           steps: {},
           values: {},
         }),
-      /Linear issue identifier is unavailable/u,
+      /Linear session facts are unavailable/u,
     );
   });
 });

@@ -7,8 +7,12 @@ export type ExpressionPath =
     }
   | { namespace: "steps"; stepId: string; path: readonly string[] }
   | { namespace: "values"; name: string }
-  /** The Linear issue an agent session belongs to; only `worktree.newBranch` may read it. */
-  | { namespace: "linear"; path: ["issue", "identifier"] };
+  /**
+   * Facts about the Linear agent session a run serves. `worktree.newBranch` reads the identifier to
+   * name a branch; a step prompt reads them so the agent knows which issue and which session it is
+   * answering without the Hub restating the whole event.
+   */
+  | { namespace: "linear"; path: ["issue", "identifier"] | ["issue", "url"] | ["session", "id"] };
 
 export type Expression =
   | { kind: "literal"; value: JsonValue }
@@ -32,7 +36,19 @@ export interface ExpressionContext {
 }
 
 export interface LinearExpressionContext {
-  issue: { identifier: string };
+  issue: { identifier: string; url?: string };
+  session?: { id: string };
+}
+
+function readLinearPath(
+  path: readonly string[],
+  linear: LinearExpressionContext | undefined,
+): JsonValue {
+  if (linear === undefined) {
+    throw new ExpressionEvaluationError("Linear session facts are unavailable");
+  }
+  if (path[0] === "session") return linear.session?.id ?? null;
+  return path[1] === "url" ? (linear.issue.url ?? null) : linear.issue.identifier;
 }
 
 export class ExpressionSyntaxError extends Error {
@@ -131,13 +147,13 @@ export function parseExpression(source: string): Expression {
     if (parts[0] === "values" && parts.length === 2) {
       return { kind: "path", value: { namespace: "values", name: parts[1]! } };
     }
-    if (
-      parts[0] === "linear" &&
-      parts.length === 3 &&
-      parts[1] === "issue" &&
-      parts[2] === "identifier"
-    ) {
-      return { kind: "path", value: { namespace: "linear", path: ["issue", "identifier"] } };
+    if (parts[0] === "linear" && parts.length === 3) {
+      if (parts[1] === "issue" && (parts[2] === "identifier" || parts[2] === "url")) {
+        return { kind: "path", value: { namespace: "linear", path: ["issue", parts[2]] } };
+      }
+      if (parts[1] === "session" && parts[2] === "id") {
+        return { kind: "path", value: { namespace: "linear", path: ["session", "id"] } };
+      }
     }
     throw new ExpressionSyntaxError(`unsupported path ${parts.join(".")}`);
   }
@@ -427,12 +443,7 @@ function readPath(path: ExpressionPath, context: ExpressionContext): JsonValue {
     }
     return context.inputs[path.path[1]] ?? null;
   }
-  if (path.namespace === "linear") {
-    if (context.linear === undefined) {
-      throw new ExpressionEvaluationError("Linear issue identifier is unavailable");
-    }
-    return context.linear.issue.identifier;
-  }
+  if (path.namespace === "linear") return readLinearPath(path.path, context.linear);
   if (path.namespace === "values") {
     const expression = context.values[path.name];
     if (expression === undefined)

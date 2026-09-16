@@ -1047,6 +1047,20 @@ function validateExpressionContract(
     }
   }
 
+  /**
+   * A step prompt may name the issue and the session it serves: an agent that reads Linear itself
+   * needs those two handles, and nothing else the Hub would otherwise restate. Everywhere else the
+   * only Linear fact a trigger may read is the branch name.
+   */
+  function validateLinearReference(
+    path: string,
+    authorityBearing: boolean,
+    contextAllowed: boolean,
+  ): void {
+    if (contextAllowed && !authorityBearing) return;
+    throw new Error(`${path} uses linear.issue outside environment worktree.newBranch`);
+  }
+
   function validateReference(
     reference: ExpressionPath,
     ordinal: number,
@@ -1081,7 +1095,8 @@ function validateExpressionContract(
       return;
     }
     if (reference.namespace === "linear") {
-      throw new Error(`${path} uses linear.issue outside environment worktree.newBranch`);
+      validateLinearReference(path, authorityBearing, contextAllowed);
+      return;
     }
     const referencedOrdinal = stepOrdinals.get(reference.stepId);
     if (referencedOrdinal === undefined)

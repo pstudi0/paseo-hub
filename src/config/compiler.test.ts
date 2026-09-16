@@ -1118,22 +1118,24 @@ describe("Linear agent session configuration", () => {
     }
   });
 
-  it("keeps linear.issue out of prompts, conditions, and values", () => {
+  it("keeps linear.issue out of conditions and values, but lets a prompt name the session", () => {
     const trigger = sessionTrigger("linear.agent_session_created");
     const step = trigger.steps[0]!;
-    assert.throws(
-      () =>
-        compileHubConfig({
-          ...configuration(),
-          triggers: [
+    // An agent that reads Linear itself needs the two handles, and nothing else restated.
+    compileHubConfig({
+      ...configuration(),
+      triggers: [
+        {
+          ...trigger,
+          steps: [
             {
-              ...trigger,
-              steps: [{ ...step, prompt: [{ text: "${{ linear.issue.identifier }}" }] }],
+              ...step,
+              prompt: [{ text: "${{ linear.issue.identifier }} ${{ linear.session.id }}" }],
             },
           ],
-        }),
-      /step work prompt\[0\] uses linear\.issue outside environment worktree\.newBranch/u,
-    );
+        },
+      ],
+    });
     assert.throws(
       () =>
         compileHubConfig({

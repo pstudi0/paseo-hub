@@ -952,7 +952,10 @@ function buildStepIntent(
       ...(step.github === undefined ? {} : { github: step.github }),
       prompt: step.prompt
         .map((block) =>
-          renderExpressionTemplate(block.kind === "text" ? block.value : block.content, context),
+          renderExpressionTemplate(block.kind === "text" ? block.value : block.content, {
+            ...context,
+            ...(linear === undefined ? {} : { linear }),
+          }),
         )
         .join("\n"),
       agent,
@@ -1111,7 +1114,16 @@ function readLinearIssueExpressionContext(
   if (!isRecord(linear) || linear["event_type"] !== "agent_session") return undefined;
   const issue = linear["issue"];
   if (!isRecord(issue) || typeof issue["identifier"] !== "string") return undefined;
-  return { issue: { identifier: issue["identifier"] } };
+  const session = linear["session"];
+  return {
+    issue: {
+      identifier: issue["identifier"],
+      ...(typeof issue["url"] === "string" ? { url: issue["url"] } : {}),
+    },
+    ...(isRecord(session) && typeof session["id"] === "string"
+      ? { session: { id: session["id"] } }
+      : {}),
+  };
 }
 
 function inputContext(value: unknown): Readonly<Record<string, JsonPrimitive>> {
