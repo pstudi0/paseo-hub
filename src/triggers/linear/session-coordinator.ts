@@ -10,7 +10,11 @@ import type {
 } from "../../db/types.js";
 import { reportFailure } from "../../failures/index.js";
 import { logger } from "../../logger.js";
-import type { LinearActivityContent, LinearPlanStep } from "../../providers/linear/client.js";
+import {
+  LinearApiError,
+  type LinearActivityContent,
+  type LinearPlanStep,
+} from "../../providers/linear/client.js";
 import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import { deriveLinearActivityId } from "./activity-id.js";
 import {
@@ -25,6 +29,7 @@ import type { LinearSessionState } from "./session-state.js";
 
 export const LINEAR_KEEPALIVE_MS = 25 * 60_000;
 const TEAM_STATES_TTL_MS = 5 * 60_000;
+const LINEAR_DEADLOCK_RETRY_DELAYS_MS = [700, 2_000, 5_000] as const;
 const GITHUB_PULL_REQUEST_URL = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/u;
 
 export type LinearSessionCoordinatorDatabase = Pick<
@@ -180,10 +185,14 @@ export class LinearSessionCoordinator {
         commentId: sourceCommentId,
       });
       if (root === undefined || root === event.session.commentId) return false;
-      const forked = await client.createAgentSessionOnComment({
-        linearOrganizationId: event.organizationId,
-        commentId: root,
-      });
+      // Linear is still writing the prompt activity onto the other session when we ask it to open
+      // a session on the same comment, and reports the lock conflict as DEADLOCK_DETECTED.
+      const forked = await this.retryOnDeadlock(() =>
+        client.createAgentSessionOnComment({
+          linearOrganizationId: event.organizationId,
+          commentId: root,
+        }),
+      );
       logger.info(
         { sessionId: event.session.id, forkedSessionId: forked.id, commentId: root },
         "opened a Linear agent session on the commented thread",
@@ -193,6 +202,24 @@ export class LinearSessionCoordinator {
       // The answer still reaches the session's own thread; losing the fork is not losing the reply.
       this.report(error, "linear.session.fork");
       return false;
+    }
+  }
+
+  private async retryOnDeadlock<T>(operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await operation();
+      } catch (error) {
+        const retriable =
+          error instanceof LinearApiError && error.code === "DEADLOCK_DETECTED" && attempt < 3;
+        if (!retriable) throw error;
+        await new Promise<void>((resolve) => {
+          (this.options.setTimeout ?? globalThis.setTimeout)(
+            () => resolve(),
+            LINEAR_DEADLOCK_RETRY_DELAYS_MS[attempt] ?? 3_000,
+          );
+        });
+      }
     }
   }
 
