@@ -364,8 +364,8 @@ describe("Linear mirror", () => {
       .map((call) => field(call, "content"));
     assert.deepEqual(activities.at(-3), {
       type: "action",
-      action: "Exécution",
-      parameter: "npm test",
+      action: "Lancement",
+      parameter: "des tests",
     });
     // A tool call the daemon did not describe still reads as plain words, never "Bash Bash".
     assert.deepEqual(describeToolCall({ name: "Bash" }), {
@@ -381,7 +381,23 @@ describe("Linear mirror", () => {
         name: "Bash",
         detail: { type: "shell", command: "git log --oneline -25 && ls docs" },
       }),
-      { verb: "Exécution", parameter: "git log" },
+      { verb: "Lecture", parameter: "de l'historique" },
+    );
+    // A command nobody outside engineering would recognise is named by its role, never by itself.
+    assert.deepEqual(
+      describeToolCall({ name: "Bash", detail: { type: "shell", command: "cat AGENTS.md" } }),
+      { verb: "Lecture", parameter: "d'un fichier" },
+    );
+    assert.deepEqual(
+      describeToolCall({
+        name: "Bash",
+        detail: { type: "shell", command: "cd /srv/app && pnpm run lint" },
+      }),
+      { verb: "Vérification", parameter: "du style du code" },
+    );
+    assert.deepEqual(
+      describeToolCall({ name: "Bash", detail: { type: "shell", command: "./scripts/weird.sh" } }),
+      { verb: "Exécution", parameter: "d'une commande" },
     );
     assert.deepEqual(activities.at(-2), { type: "thought", body: "Tests pass; wrapping up." });
     assert.deepEqual(activities.at(-1), { type: "response", body: "Tests pass; wrapping up." });

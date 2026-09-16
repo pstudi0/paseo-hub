@@ -493,13 +493,120 @@ const TOOL_NAMES: Readonly<Record<string, { verb: string; parameter: string }>> 
   toolsearch: { verb: "Chargement", parameter: "de ses outils" },
 };
 
-/** A shell command reads better as its program and first argument than as a full command line. */
-function summarizeCommand(command: string): string {
-  const words = command.trim().split(/\s+/u);
-  const program = words[0] ?? "";
-  const subcommand =
-    words[1] !== undefined && /^[a-z][\w-]*$/u.test(words[1]) ? ` ${words[1]}` : "";
-  return `${program}${subcommand}`;
+/**
+ * What a shell command is *for*, in five words at most. A program name such as `cat` or `wc` tells
+ * a non-developer nothing, so the timeline names the role instead: the first table matches a
+ * program together with its subcommand, the second the program alone, and anything unknown stays
+ * "Exécution d'une commande" rather than leaking a binary name.
+ */
+const COMMAND_ROLES: Readonly<Record<string, { verb: string; parameter: string }>> = {
+  "git status": { verb: "Vérification", parameter: "des modifications en cours" },
+  "git diff": { verb: "Vérification", parameter: "des modifications en cours" },
+  "git log": { verb: "Lecture", parameter: "de l'historique" },
+  "git show": { verb: "Lecture", parameter: "de l'historique" },
+  "git add": { verb: "Préparation", parameter: "des modifications" },
+  "git commit": { verb: "Enregistrement", parameter: "des modifications" },
+  "git push": { verb: "Envoi", parameter: "des modifications sur GitHub" },
+  "git pull": { verb: "Récupération", parameter: "des dernières modifications" },
+  "git fetch": { verb: "Récupération", parameter: "des dernières modifications" },
+  "git checkout": { verb: "Changement", parameter: "de branche" },
+  "git switch": { verb: "Changement", parameter: "de branche" },
+  "git branch": { verb: "Lecture", parameter: "des branches" },
+  "git worktree": { verb: "Préparation", parameter: "de l'espace de travail" },
+  "gh pr": { verb: "Gestion", parameter: "de la pull request" },
+  "gh issue": { verb: "Consultation", parameter: "d'une issue GitHub" },
+  "gh repo": { verb: "Consultation", parameter: "du dépôt GitHub" },
+  "gh run": { verb: "Vérification", parameter: "de l'intégration continue" },
+  "docker compose": { verb: "Gestion", parameter: "des conteneurs" },
+};
+
+const COMMAND_PROGRAMS: Readonly<Record<string, { verb: string; parameter: string }>> = {
+  cat: { verb: "Lecture", parameter: "d'un fichier" },
+  head: { verb: "Lecture", parameter: "d'un fichier" },
+  tail: { verb: "Lecture", parameter: "d'un fichier" },
+  less: { verb: "Lecture", parameter: "d'un fichier" },
+  ls: { verb: "Liste", parameter: "des fichiers" },
+  tree: { verb: "Liste", parameter: "des fichiers" },
+  find: { verb: "Recherche", parameter: "de fichiers" },
+  fd: { verb: "Recherche", parameter: "de fichiers" },
+  grep: { verb: "Recherche", parameter: "dans le code" },
+  rg: { verb: "Recherche", parameter: "dans le code" },
+  wc: { verb: "Comptage", parameter: "de lignes" },
+  sed: { verb: "Modification", parameter: "d'un fichier" },
+  awk: { verb: "Lecture", parameter: "d'un fichier" },
+  jq: { verb: "Lecture", parameter: "de données" },
+  mkdir: { verb: "Création", parameter: "d'un dossier" },
+  touch: { verb: "Création", parameter: "d'un fichier" },
+  cp: { verb: "Copie", parameter: "de fichiers" },
+  mv: { verb: "Déplacement", parameter: "de fichiers" },
+  rm: { verb: "Suppression", parameter: "de fichiers" },
+  chmod: { verb: "Changement", parameter: "des droits d'un fichier" },
+  curl: { verb: "Appel", parameter: "d'une adresse web" },
+  wget: { verb: "Appel", parameter: "d'une adresse web" },
+  echo: { verb: "Affichage", parameter: "d'un message" },
+  printf: { verb: "Affichage", parameter: "d'un message" },
+  node: { verb: "Exécution", parameter: "d'un script" },
+  python: { verb: "Exécution", parameter: "d'un script" },
+  python3: { verb: "Exécution", parameter: "d'un script" },
+  docker: { verb: "Gestion", parameter: "des conteneurs" },
+  git: { verb: "Gestion", parameter: "du dépôt" },
+  gh: { verb: "Consultation", parameter: "de GitHub" },
+};
+
+/** Package managers say what they do through their subcommand, not their name. */
+const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun", "npx", "pnpx"]);
+const SCRIPT_ROLES: Readonly<Record<string, { verb: string; parameter: string }>> = {
+  install: { verb: "Installation", parameter: "des dépendances" },
+  i: { verb: "Installation", parameter: "des dépendances" },
+  add: { verb: "Installation", parameter: "des dépendances" },
+  ci: { verb: "Installation", parameter: "des dépendances" },
+  test: { verb: "Lancement", parameter: "des tests" },
+  vitest: { verb: "Lancement", parameter: "des tests" },
+  jest: { verb: "Lancement", parameter: "des tests" },
+  pytest: { verb: "Lancement", parameter: "des tests" },
+  build: { verb: "Compilation", parameter: "du projet" },
+  tsc: { verb: "Vérification", parameter: "des types" },
+  typecheck: { verb: "Vérification", parameter: "des types" },
+  lint: { verb: "Vérification", parameter: "du style du code" },
+  eslint: { verb: "Vérification", parameter: "du style du code" },
+  oxlint: { verb: "Vérification", parameter: "du style du code" },
+  format: { verb: "Mise en forme", parameter: "du code" },
+  prettier: { verb: "Mise en forme", parameter: "du code" },
+  dev: { verb: "Démarrage", parameter: "du serveur de développement" },
+  start: { verb: "Démarrage", parameter: "du serveur" },
+};
+
+const SHELL_FALLBACK = { verb: "Exécution", parameter: "d'une commande" } as const;
+/** Words that only set the scene; the interesting command is whatever follows them. */
+const COMMAND_PREFIXES = new Set(["sudo", "time", "env", "nohup", "exec", "command"]);
+
+function describeCommand(command: string): { verb: string; parameter: string } {
+  for (const segment of command.split(/&&|\|\||[|;]/u)) {
+    const described = describeCommandSegment(segment);
+    if (described !== undefined) return described;
+  }
+  return SHELL_FALLBACK;
+}
+
+function describeCommandSegment(segment: string): { verb: string; parameter: string } | undefined {
+  const words = segment
+    .trim()
+    .split(/\s+/u)
+    .filter((word) => word.length > 0 && !/^[A-Z_][A-Z0-9_]*=/u.test(word));
+  while (words.length > 0 && COMMAND_PREFIXES.has(words[0] ?? "")) words.shift();
+  const program = (words[0] ?? "").split("/").pop() ?? "";
+  if (program === "" || program === "cd" || program === "set" || program === "export") {
+    return undefined;
+  }
+  const argument = words[1] ?? "";
+  if (PACKAGE_MANAGERS.has(program)) {
+    // `pnpm run test` and `pnpm test` mean the same thing to the reader.
+    const script = (argument === "run" || argument === "exec" ? words[2] : argument) ?? "";
+    return SCRIPT_ROLES[script] ?? { verb: "Exécution", parameter: "d'une commande du projet" };
+  }
+  const role = COMMAND_ROLES[`${program} ${argument}`];
+  if (role !== undefined) return role;
+  return COMMAND_PROGRAMS[program] ?? SCRIPT_ROLES[program];
 }
 
 /**
@@ -514,7 +621,7 @@ export function describeToolCall(item: {
   if (detailed !== undefined) return detailed;
   // No usable detail: fall back to what the tool is commonly called.
   const shortName = item.name.split(/__|\./u).pop() ?? item.name;
-  return TOOL_NAMES[shortName.toLowerCase()] ?? { verb: "Exécution", parameter: shortName };
+  return TOOL_NAMES[shortName.toLowerCase()] ?? SHELL_FALLBACK;
 }
 
 /** The reliable path: Paseo told us what kind of tool call this is and what it acted on. */
@@ -534,7 +641,7 @@ function describeFromDetail(
     if (parameter !== undefined) break;
   }
   if (parameter === undefined) return undefined;
-  if (type === "shell") parameter = summarizeCommand(parameter);
+  if (type === "shell") return describeCommand(parameter);
   const searchTool = type === "search" ? text("toolName") : undefined;
   if (searchTool !== undefined) parameter = `${searchTool}: ${parameter}`;
   return { verb: mapping.verb, parameter: truncate(firstLine(parameter), PARAMETER_MAX_CHARS) };
