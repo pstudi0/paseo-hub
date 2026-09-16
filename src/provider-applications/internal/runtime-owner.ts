@@ -400,6 +400,32 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
             },
           }
         : {}),
+      ...(provider === "linear"
+        ? {
+            integration: {
+              resolve: (
+                ...args: Parameters<NonNullable<ProviderRegistration["integration"]>["resolve"]>
+              ) => {
+                const active = slot.active;
+                const integration = active?.registration.integration;
+                if (active === undefined || integration === undefined) {
+                  throw unavailable("linear_integration_unavailable");
+                }
+                return this.withLease(active, () => integration.resolve(...args));
+              },
+              linearAuthority: {
+                revoke: (token: string) => {
+                  const active = slot.active;
+                  const authority = active?.registration.integration?.linearAuthority;
+                  if (active === undefined || authority === undefined) {
+                    throw unavailable("linear_integration_unavailable");
+                  }
+                  return this.withLease(active, () => authority.revoke(token));
+                },
+              },
+            },
+          }
+        : {}),
       triggerProviders: [
         (resources) => {
           slot.triggerResources = resources;
