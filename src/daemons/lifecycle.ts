@@ -2155,8 +2155,10 @@ async function buildCreateAgentOptions(
   capabilities: OutputExecutorRegistry,
   materializedEnv: Readonly<Record<string, string>>,
 ): Promise<DaemonCreateAgentOptions> {
+  const title = agentTitle(intent.triggerContext);
   return {
     provider: intent.agent.provider,
+    ...(title === undefined ? {} : { title }),
     ...(intent.agent.mode === undefined ? {} : { mode: intent.agent.mode }),
     ...(intent.agent.model === undefined ? {} : { model: intent.agent.model }),
     ...(intent.agent.thinkingOptionId === undefined
@@ -2182,6 +2184,31 @@ async function buildCreateAgentOptions(
           worktree: intent.environment.worktree,
         }),
   };
+}
+
+/**
+ * What the daemon shows on an agent's tab. The workspace already carries the issue, so the tab
+ * answers the other question: what started this run. Untitled tabs are indistinguishable once an
+ * issue has been worked on more than once.
+ */
+function isTitleRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function agentTitle(triggerContext: unknown): string | undefined {
+  if (!isTitleRecord(triggerContext) || triggerContext["provider"] !== "linear") return undefined;
+  const event = triggerContext["event"];
+  if (!isTitleRecord(event)) return undefined;
+  const linear = event["linear"];
+  if (!isTitleRecord(linear) || linear["event_type"] !== "agent_session") return undefined;
+  const comment = linear["comment"];
+  const commentId =
+    isTitleRecord(comment) && typeof comment["id"] === "string" ? comment["id"] : null;
+  if (linear["source"] === "mention" && commentId !== null) {
+    return `Mention COM-${commentId.slice(0, 8)}`;
+  }
+  if (linear["action"] === "prompted") return "Relance";
+  return linear["source"] === "automation" ? "Automatisation" : "Délégation";
 }
 
 function buildAgentEnv(

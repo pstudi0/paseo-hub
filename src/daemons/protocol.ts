@@ -8,6 +8,8 @@ import type {
 
 export interface DaemonCreateAgentOptions {
   provider: string;
+  /** What the daemon shows on the agent's tab; without it every agent is an untitled tab. */
+  title?: string;
   mode?: string;
   model?: string;
   thinkingOptionId?: string;
