@@ -115,6 +115,9 @@ export class LinearSessionCoordinator {
         ],
       });
     }
+    // A mention written inside a human thread makes Linear open the session on that reply, so the
+    // thread itself would only ever show a session card. Answer where the person is looking.
+    await this.echoIntoThread(event, event.session.commentId);
     const identifier = record.issueIdentifier ?? event.session.issue?.identifier ?? "";
     const summary = normalizeLinearSummary(`${identifier} - ${event.session.issue?.title ?? ""}`);
     if (summary !== undefined) void this.updateSession(target, { summary });
@@ -139,7 +142,7 @@ export class LinearSessionCoordinator {
       await this.stop(record, activity.user.name);
       return "stopped";
     }
-    await this.echoIntoThread(event, activity);
+    await this.echoIntoThread(event, activity.sourceCommentId);
     if (record.pendingPermission !== null) {
       void this.answerPermission(record, record.pendingPermission, activity.body).catch(
         (error: unknown) => this.report(error, "linear.permission.answer", record),
@@ -258,10 +261,9 @@ export class LinearSessionCoordinator {
    */
   private async echoIntoThread(
     event: NormalizedLinearAgentSessionEvent,
-    activity: NonNullable<NormalizedLinearAgentSessionEvent["activity"]>,
+    sourceCommentId: string | null,
   ): Promise<void> {
     const client = this.options.state.client;
-    const sourceCommentId = activity.sourceCommentId;
     const issueId = event.session.issue?.id;
     if (client === undefined || sourceCommentId === null || issueId === undefined) return;
     try {

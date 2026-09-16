@@ -100,6 +100,31 @@ describe("Linear session coordinator", () => {
     assert.equal(await world.coordinator.followUp(promptedEvent(), sessionInput()), "dispatch");
   });
 
+  it("replies in the thread when a mention opens the session on a thread reply", async () => {
+    const world = createWorld();
+    // Linear anchors the session on the mention itself, which sits under an existing root comment.
+    world.client.threadRoot = LINEAR_FIXTURE.rootCommentId;
+    await world.coordinator.acknowledge(mentionEvent(), sessionInput());
+
+    assert.deepEqual(
+      world.client.calls
+        .filter((call) => call.method === "createComment")
+        .map((call) => ({ parentId: field(call, "parentId"), body: field(call, "body") })),
+      [{ parentId: LINEAR_FIXTURE.rootCommentId, body: LINEAR_COPY.workingInThread }],
+    );
+  });
+
+  it("leaves a delegation thread alone, since the session already is that thread", async () => {
+    const world = createWorld();
+    world.client.threadRoot = LINEAR_FIXTURE.rootCommentId;
+    await world.coordinator.acknowledge(createdEvent(), sessionInput());
+
+    assert.deepEqual(
+      world.client.calls.filter((call) => call.method === "createComment"),
+      [],
+    );
+  });
+
   it("answers in the commented thread instead of taking the thread over", async () => {
     const world = createWorld();
     await world.coordinator.acknowledge(createdEvent(), sessionInput());
@@ -500,6 +525,10 @@ function sessionInput() {
 
 function createdEvent(): NormalizedLinearAgentSessionEvent {
   return sessionEvent(readLinearFixture("linear-agent-session-created"));
+}
+
+function mentionEvent(): NormalizedLinearAgentSessionEvent {
+  return sessionEvent(readLinearFixture("linear-agent-session-created-mention"));
 }
 
 function promptedEvent(
