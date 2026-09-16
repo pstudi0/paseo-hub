@@ -413,16 +413,6 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
                 }
                 return this.withLease(active, () => integration.resolve(...args));
               },
-              linearAuthority: {
-                revoke: (token: string) => {
-                  const active = slot.active;
-                  const authority = active?.registration.integration?.linearAuthority;
-                  if (active === undefined || authority === undefined) {
-                    throw unavailable("linear_integration_unavailable");
-                  }
-                  return this.withLease(active, () => authority.revoke(token));
-                },
-              },
             },
           }
         : {}),

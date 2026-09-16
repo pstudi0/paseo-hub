@@ -1,4 +1,3 @@
-import type { ConnectionResolutionContext } from "../../config/connections.js";
 import type { AuthServer } from "../../auth/server.js";
 import {
   CONNECTION_ATTEMPT_LIFETIME_MINUTES,
@@ -175,7 +174,7 @@ export function createLinearRegistration(
       callbackOrigin: options.publicBaseUrl,
     },
     connection,
-    integration: linearIntegration(database, connectionClient),
+    ...(api === undefined ? {} : { integration: linearIntegration(database, api) }),
     triggerProviders: [
       ({ configurationStoreForProject }) =>
         createLinearTriggerProvider({
@@ -522,21 +521,19 @@ function linearStatus(configured: boolean, bindings: readonly LinearConnectionRe
 }
 
 /**
- * Hands an agent a Linear token of its own for the run, through the same
- * `${{ paseo.connections.<slug>.token }}` mechanism GitHub already uses. The token is minted with
- * the `client_credentials` grant, which is what Linear recommends for automation — "request a new
- * client credentials token at the start of each run, then use it only for that run" — and the Hub
- * revokes it when the execution ends. It is an `app` actor token, so everything the agent does with
- * it is attributed to the agent application, never to a person.
+ * Hands an agent the app's installation token for the run, through the same
+ * `${{ paseo.connections.<slug>.token }}` mechanism GitHub already uses, so the agent talks to
+ * Linear itself with the agent application's identity.
+ *
+ * It deliberately does NOT mint a `client_credentials` token per run, although Linear recommends
+ * that shape for automation. Revoking such a token through `/oauth/revoke`, authenticated with the
+ * application's own client id and secret, revoked the workspace installation itself and left the
+ * Hub unable to authenticate at all. Until a token can be retired without taking the installation
+ * with it, the run reuses the stored token, which the Hub already refreshes.
  */
-function linearIntegration(database: Database, connectionClient: LinearConnectionClient) {
+function linearIntegration(database: Database, api: LinearApiClient) {
   return {
-    async resolve(
-      projectId: string,
-      connectionSlug: string,
-      value: string,
-      context?: ConnectionResolutionContext,
-    ): Promise<string> {
+    async resolve(projectId: string, connectionSlug: string, value: string): Promise<string> {
       if (value !== "token") {
         throw new Error(`unsupported linear integration value: ${value}`);
       }
@@ -552,16 +549,7 @@ function linearIntegration(database: Database, connectionClient: LinearConnectio
       if (selected === undefined) {
         throw new Error(`linear connection is unavailable: ${connectionSlug}`);
       }
-      const minted = await connectionClient.mintRunToken();
-      await context?.registerToken?.({
-        provider: "linear",
-        token: minted.accessToken,
-        expiresAt: minted.expiresAt,
-      });
-      return minted.accessToken;
-    },
-    linearAuthority: {
-      revoke: (token: string): Promise<void> => connectionClient.revoke(token),
+      return api.accessTokenFor(selected.linearOrganizationId);
     },
   };
 }
