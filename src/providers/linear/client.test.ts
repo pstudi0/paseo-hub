@@ -988,6 +988,7 @@ describe("Linear API client contracts", () => {
       "attachmentLinkGitHubPR",
       "attachmentLinkURL",
       "commentCreate",
+      "commentThreadAuthors",
       "commentThreadRoot",
       "issue",
       "issueCommentHistory",

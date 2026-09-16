@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import type { ExecutionControl } from "../../daemons/execution-control.js";
+import type { LinearLifecycleEvent } from "./lifecycle-events.js";
 import type {
   AgentExecutionRecord,
   LinearAgentSessionPatch,
   LinearAgentSessionRecord,
+  LinearLifecycleReceiptClaim,
   LinearPendingPrompt,
   UpsertLinearAgentSessionInput,
 } from "../../db/types.js";
@@ -164,6 +166,53 @@ describe("Linear session coordinator", () => {
       type: "response",
       body: LINEAR_COPY.nothingRunning,
     });
+  });
+});
+
+describe("Linear thread replies without a mention", () => {
+  it("wakes the agent on a reply in a thread it already wrote in", async () => {
+    const world = createWorld();
+    world.client.threadAuthors = [LINEAR_FIXTURE.appUserId, LINEAR_FIXTURE.humanId];
+    await world.coordinator.applyLifecycle(
+      newCommentNotification(LINEAR_FIXTURE.rootCommentId),
+      claim(),
+    );
+    assert.deepEqual(
+      world.client.calls.filter((call) => call.method === "createAgentSessionOnComment"),
+      [
+        {
+          method: "createAgentSessionOnComment",
+          input: {
+            linearOrganizationId: LINEAR_FIXTURE.organizationId,
+            commentId: LINEAR_FIXTURE.rootCommentId,
+          },
+        },
+      ],
+    );
+  });
+
+  it("stays out of a thread it never wrote in, and out of its own replies", async () => {
+    const world = createWorld();
+    world.client.threadAuthors = [LINEAR_FIXTURE.humanId, LINEAR_FIXTURE.otherHumanId];
+    await world.coordinator.applyLifecycle(
+      newCommentNotification(LINEAR_FIXTURE.rootCommentId),
+      claim(),
+    );
+
+    world.client.threadAuthors = [LINEAR_FIXTURE.appUserId];
+    await world.coordinator.applyLifecycle(
+      newCommentNotification(LINEAR_FIXTURE.rootCommentId, LINEAR_FIXTURE.appUserId),
+      claim(),
+    );
+
+    // A root comment carries no thread to join.
+    world.client.threadAuthors = [LINEAR_FIXTURE.appUserId];
+    await world.coordinator.applyLifecycle(newCommentNotification(null), claim());
+
+    assert.deepEqual(
+      world.client.calls.filter((call) => call.method === "createAgentSessionOnComment"),
+      [],
+    );
   });
 });
 
@@ -386,6 +435,38 @@ const fakeTimer: LinearSessionCoordinatorTimer = (callback, delay) => {
   return unrefTimer;
 };
 
+function newCommentNotification(
+  parentCommentId: string | null,
+  actorId: string = LINEAR_FIXTURE.humanId,
+): Extract<LinearLifecycleEvent, { kind: "notification" }> {
+  return {
+    kind: "notification",
+    type: "AppUserNotification",
+    action: "issueNewComment",
+    organizationId: LINEAR_FIXTURE.organizationId,
+    oauthClientId: LINEAR_FIXTURE.oauthClientId,
+    appUserId: LINEAR_FIXTURE.appUserId,
+    notification: {
+      issueId: LINEAR_FIXTURE.issueId,
+      actorId,
+      commentId: LINEAR_FIXTURE.previousCommentId,
+      parentCommentId,
+    },
+    webhookId: LINEAR_FIXTURE.webhookId,
+    createdAt: "2026-09-16T10:00:00.000Z",
+  };
+}
+
+function claim(): Extract<LinearLifecycleReceiptClaim, { status: "claimed" }> {
+  return {
+    status: "claimed",
+    providerEventReceiptId: "receipt-1",
+    connectionId: CONNECTION_ID,
+    organizationId: ORGANIZATION_ID,
+    linearOrganizationId: LINEAR_FIXTURE.organizationId,
+  };
+}
+
 function sessionInput() {
   return { connectionId: CONNECTION_ID, organizationId: ORGANIZATION_ID };
 }
@@ -515,6 +596,8 @@ class RecordingClient {
   calls: { method: string; input: Record<string, unknown> }[] = [];
   /** The thread root `readCommentThreadRoot` reports; tests override it to fork a session. */
   threadRoot: string | undefined = undefined;
+  /** Who already wrote in the thread; tests override it to allow or refuse a wake-up. */
+  threadAuthors: readonly string[] = [];
   private inFlight: Promise<unknown>[] = [];
 
   /** The methods the coordinator calls; anything else throws when reached. */
@@ -528,6 +611,7 @@ class RecordingClient {
       updateAgentSession: (input) => this.updateAgentSession(input),
       readAgentSessionActivities: unsupported,
       readCommentThreadRoot: () => Promise.resolve(this.threadRoot),
+      readCommentThreadAuthors: () => Promise.resolve(this.threadAuthors),
       createAgentSessionOnComment: (input) => {
         this.calls.push({ method: "createAgentSessionOnComment", input: asRecord(input) });
         return Promise.resolve({ id: "session-on-comment" });

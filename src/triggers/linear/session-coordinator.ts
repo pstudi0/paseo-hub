@@ -172,6 +172,39 @@ export class LinearSessionCoordinator {
    * sends a `created` event that starts the run. Returns false when the prompt is already in the
    * session's own thread, which needs no forking.
    */
+  /**
+   * A reply posted in a thread without mentioning the agent produces no session event at all,
+   * only this notification. Linear's own example agent answers exactly when the agent already
+   * wrote in that thread, which keeps it out of conversations between people while letting it
+   * follow up on its own answers. Opening a session on the thread root is what makes its
+   * activities and its reply render under the comment.
+   */
+  private async wakeOnThreadReply(event: Extract<LinearLifecycleEvent, { kind: "notification" }>) {
+    const client = this.options.state.client;
+    const rootCommentId = event.notification.parentCommentId;
+    if (client === undefined || rootCommentId === null || rootCommentId === undefined) return;
+    if (event.notification.actorId === event.appUserId) return;
+    try {
+      const authors = await client.readCommentThreadAuthors({
+        linearOrganizationId: event.organizationId,
+        rootCommentId,
+      });
+      if (!authors.includes(event.appUserId)) return;
+      const opened = await this.retryOnDeadlock(() =>
+        client.createAgentSessionOnComment({
+          linearOrganizationId: event.organizationId,
+          commentId: rootCommentId,
+        }),
+      );
+      logger.info(
+        { commentId: rootCommentId, sessionId: opened.id },
+        "opened a Linear agent session on a reply in the agent's own thread",
+      );
+    } catch (error) {
+      this.report(error, "linear.thread_reply.wake");
+    }
+  }
+
   private async forkOntoComment(
     event: NormalizedLinearAgentSessionEvent,
     activity: NonNullable<NormalizedLinearAgentSessionEvent["activity"]>,
@@ -317,6 +350,11 @@ export class LinearSessionCoordinator {
         { linearOrganizationId: claim.linearOrganizationId, teamIds: teamAccess.teamIds },
         "Linear team access updated",
       );
+      return;
+    }
+    if (event.action === "issueNewComment") {
+      await this.wakeOnThreadReply(event);
+      await this.options.database.applyLinearLifecycle(claim, { kind: "noop" });
       return;
     }
     if (event.action === "issueUnassignedFromYou" && event.notification.issueId !== undefined) {

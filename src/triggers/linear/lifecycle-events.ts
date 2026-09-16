@@ -39,6 +39,10 @@ export const LinearAppUserNotificationSchema = z.object({
       id: z.string().optional(),
       issueId: z.string().optional(),
       actorId: z.string().nullable().optional(),
+      /** The comment that was posted; present on comment notifications. */
+      commentId: z.string().optional(),
+      /** The thread's root comment when the new comment is a reply; absent on a root comment. */
+      parentCommentId: z.string().nullable().optional(),
     })
     .passthrough(),
   webhookId: z.string(),

@@ -72,6 +72,13 @@ export const LINEAR_GRAPHQL_DOCUMENTS = {
   commentThreadRoot: `query PaseoCommentThreadRoot($id: String!) {
     comment(id: $id) { id parent { id } }
   }`,
+  commentThreadAuthors: `query PaseoCommentThreadAuthors($id: String!) {
+    comment(id: $id) {
+      id
+      user { id }
+      children(first: 100) { nodes { id user { id } } }
+    }
+  }`,
   agentSessionCreateOnComment: `mutation PaseoAgentSessionCreateOnComment($commentId: String!) {
     agentSessionCreateOnComment(input: { commentId: $commentId }) {
       success
@@ -224,6 +231,17 @@ const AgentSessionUpdateResponseSchema = z.object({
 const CommentThreadRootResponseSchema = z.object({
   data: z.object({
     comment: z.object({ id: z.string(), parent: z.object({ id: z.string() }).nullable() }),
+  }),
+});
+
+const CommentThreadAuthorsResponseSchema = z.object({
+  data: z.object({
+    comment: z.object({
+      user: z.object({ id: z.string() }).nullable(),
+      children: z.object({
+        nodes: z.array(z.object({ user: z.object({ id: z.string() }).nullable() })),
+      }),
+    }),
   }),
 });
 
@@ -485,6 +503,14 @@ export interface LinearApiClient {
     linearOrganizationId: string;
     commentId: string;
   }): Promise<string | undefined>;
+  /**
+   * The ids of everyone who wrote in the thread rooted at `rootCommentId`, the root included.
+   * Used to tell a thread the agent already takes part in from a conversation between people.
+   */
+  readCommentThreadAuthors(input: {
+    linearOrganizationId: string;
+    rootCommentId: string;
+  }): Promise<readonly string[]>;
   /**
    * Opens an agent session on a comment thread so the agent's activities and its answer render
    * under that comment, instead of in the thread of a session Linear reused for the issue.
@@ -885,6 +911,23 @@ export function createLinearApiClient(options: {
         ),
       );
       return result.data.comment.parent?.id ?? result.data.comment.id;
+    },
+    async readCommentThreadAuthors(input) {
+      const result = CommentThreadAuthorsResponseSchema.parse(
+        await graphql(
+          request,
+          await accessTokenFor(input.linearOrganizationId),
+          {
+            query: LINEAR_GRAPHQL_DOCUMENTS.commentThreadAuthors,
+            variables: { id: input.rootCommentId },
+          },
+          transport,
+        ),
+      );
+      const comment = result.data.comment;
+      return [comment.user, ...comment.children.nodes.map((child) => child.user)]
+        .filter((user) => user !== null)
+        .map((user) => user.id);
     },
     async createAgentSessionOnComment(input) {
       const result = AgentSessionCreateResponseSchema.parse(
