@@ -390,10 +390,29 @@ describe("Linear mirror", () => {
       }),
       { verb: "Lecture", parameter: "de l'historique" },
     );
-    // A command nobody outside engineering would recognise is named by its role, never by itself.
+    // A command nobody outside engineering would recognise is named by its role and its subject.
     assert.deepEqual(
       describeToolCall({ name: "Bash", detail: { type: "shell", command: "cat AGENTS.md" } }),
-      { verb: "Lecture", parameter: "d'un fichier" },
+      { verb: "Lecture", parameter: "AGENTS.md" },
+    );
+    assert.deepEqual(
+      describeToolCall({
+        name: "Bash",
+        detail: { type: "shell", command: "grep -rn 'hero' apps/portail/src" },
+      }),
+      { verb: "Recherche de", parameter: "hero" },
+    );
+    // The worktree address is machine detail; the tail of the path is what names the file.
+    assert.deepEqual(
+      describeToolCall({
+        name: "Edit",
+        detail: {
+          type: "edit",
+          filePath:
+            "/home/agent/.paseo/worktrees/2qf/linear-eh-1/apps/portail/src/routes/index.tsx",
+        },
+      }),
+      { verb: "Modification", parameter: "src/routes/index.tsx" },
     );
     assert.deepEqual(
       describeToolCall({
@@ -404,7 +423,7 @@ describe("Linear mirror", () => {
     );
     assert.deepEqual(
       describeToolCall({ name: "Bash", detail: { type: "shell", command: "./scripts/weird.sh" } }),
-      { verb: "Exécution", parameter: "d'une commande" },
+      { verb: "Exécution", parameter: "weird.sh" },
     );
     assert.deepEqual(activities.at(-2), { type: "thought", body: "Tests pass; wrapping up." });
     assert.deepEqual(activities.at(-1), { type: "response", body: "Tests pass; wrapping up." });

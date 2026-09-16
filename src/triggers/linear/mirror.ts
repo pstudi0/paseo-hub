@@ -588,6 +588,23 @@ function describeCommand(command: string): { verb: string; parameter: string } {
   return SHELL_FALLBACK;
 }
 
+/** Commands whose point is the file they act on; the reader wants that name, not the program. */
+const FILE_COMMANDS: Readonly<Record<string, string>> = {
+  cat: "Lecture",
+  head: "Lecture",
+  tail: "Lecture",
+  less: "Lecture",
+  wc: "Comptage des lignes",
+  sed: "Modification",
+  touch: "Création",
+  rm: "Suppression",
+  cp: "Copie",
+  mv: "Déplacement",
+  chmod: "Droits",
+};
+/** Commands whose point is what they look for. */
+const PATTERN_COMMANDS = new Set(["grep", "rg", "ag", "ack"]);
+
 function describeCommandSegment(segment: string): { verb: string; parameter: string } | undefined {
   const words = segment
     .trim()
@@ -595,18 +612,75 @@ function describeCommandSegment(segment: string): { verb: string; parameter: str
     .filter((word) => word.length > 0 && !/^[A-Z_][A-Z0-9_]*=/u.test(word));
   while (words.length > 0 && COMMAND_PREFIXES.has(words[0] ?? "")) words.shift();
   const program = (words[0] ?? "").split("/").pop() ?? "";
-  if (program === "" || program === "cd" || program === "set" || program === "export") {
-    return undefined;
-  }
+  if (program === "" || SILENT_PROGRAMS.has(program)) return undefined;
+  const operand = words.slice(1).find((word) => !word.startsWith("-"));
+  return (
+    describeScriptRun(program, words) ??
+    describeOnOperand(program, operand) ??
+    COMMAND_ROLES[`${program} ${words[1] ?? ""}`] ??
+    COMMAND_PROGRAMS[program] ??
+    SCRIPT_ROLES[program] ??
+    // An unknown program still says more with its own name and target than "une commande".
+    namedRun(program, operand)
+  );
+}
+
+const SILENT_PROGRAMS = new Set(["cd", "set", "export"]);
+
+/** `pnpm run test` and `pnpm test` mean the same thing to the reader. */
+function describeScriptRun(
+  program: string,
+  words: readonly string[],
+): { verb: string; parameter: string } | undefined {
+  if (!PACKAGE_MANAGERS.has(program)) return undefined;
   const argument = words[1] ?? "";
-  if (PACKAGE_MANAGERS.has(program)) {
-    // `pnpm run test` and `pnpm test` mean the same thing to the reader.
-    const script = (argument === "run" || argument === "exec" ? words[2] : argument) ?? "";
-    return SCRIPT_ROLES[script] ?? { verb: "Exécution", parameter: "d'une commande du projet" };
+  const script = (argument === "run" || argument === "exec" ? words[2] : argument) ?? "";
+  return SCRIPT_ROLES[script] ?? { verb: "Exécution", parameter: "d'une commande du projet" };
+}
+
+/** Commands whose point is the file they act on, or the pattern they look for. */
+function describeOnOperand(
+  program: string,
+  operand: string | undefined,
+): { verb: string; parameter: string } | undefined {
+  const fileVerb = FILE_COMMANDS[program];
+  if (fileVerb !== undefined) {
+    const target = shortPath(operand);
+    return target === undefined ? undefined : { verb: fileVerb, parameter: target };
   }
-  const role = COMMAND_ROLES[`${program} ${argument}`];
-  if (role !== undefined) return role;
-  return COMMAND_PROGRAMS[program] ?? SCRIPT_ROLES[program];
+  if (!PATTERN_COMMANDS.has(program)) return undefined;
+  const pattern = unquote(operand);
+  return pattern === undefined
+    ? { verb: "Recherche", parameter: "dans le code" }
+    : { verb: "Recherche de", parameter: pattern };
+}
+
+function namedRun(
+  program: string,
+  operand: string | undefined,
+): { verb: string; parameter: string } {
+  const target = shortPath(operand);
+  return { verb: "Exécution", parameter: target === undefined ? program : `${program} ${target}` };
+}
+
+/** Strips the quoting a shell needs but a reader does not. */
+function unquote(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const bare = value.replace(/^['"]|['"]$/gu, "");
+  return bare.length > 0 ? bare : undefined;
+}
+
+/**
+ * Paths in a worktree are mostly machine address: `/home/agent/.paseo/worktrees/2qf.../linear-eh-1/
+ * apps/portail/src/routes/index.tsx` says "index.tsx in apps/portail/src/routes" to a reader and
+ * nothing else. Keep the tail of the path, which is the part that identifies the file.
+ */
+function shortPath(value: string | undefined): string | undefined {
+  const bare = unquote(value);
+  if (bare === undefined) return undefined;
+  const segments = bare.split("/").filter((segment) => segment.length > 0 && segment !== ".");
+  if (segments.length === 0) return undefined;
+  return segments.slice(-3).join("/");
 }
 
 /**
@@ -642,6 +716,9 @@ function describeFromDetail(
   }
   if (parameter === undefined) return undefined;
   if (type === "shell") return describeCommand(parameter);
+  if (type === "read" || type === "edit" || type === "write") {
+    parameter = shortPath(parameter) ?? parameter;
+  }
   const searchTool = type === "search" ? text("toolName") : undefined;
   if (searchTool !== undefined) parameter = `${searchTool}: ${parameter}`;
   return { verb: mapping.verb, parameter: truncate(firstLine(parameter), PARAMETER_MAX_CHARS) };
